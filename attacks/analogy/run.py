@@ -45,6 +45,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from attacks.common.llm_client import is_openrouter_base_url  # noqa: E402 (lightweight, no heavy deps)
+
 ATTACK_NAME = "analogy"
 MAX_PARALLEL_DEFAULT = 4
 MAX_PARALLEL_CAP = 8
@@ -89,12 +91,15 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def _get_openrouter_client(api_key: Optional[str]):
-    from openai import OpenAI  # local import for faster CLI help
+    from attacks.common.llm_client import get_client, resolve_api_key  # local import for faster CLI help
 
-    resolved = api_key or os.environ.get("OPENROUTER_API_KEY")
+    resolved = resolve_api_key(api_key)
     if not resolved:
-        raise ValueError("OPENROUTER_API_KEY not provided. Export it or pass --openrouter-api-key.")
-    return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=resolved)
+        raise ValueError(
+            "No API key found. Set LLM_API_KEY (preferred) or OPENROUTER_API_KEY, "
+            "or pass --openrouter-api-key."
+        )
+    return get_client(api_key=resolved)
 
 
 def _parse_json_obj(text: str) -> Dict[str, Any]:
@@ -272,7 +277,7 @@ def generate_riddle_prompt_options(
             temperature=temperature,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
-            extra_body={"include_reasoning": True} if include_reasoning else {"include_reasoning": False},
+            extra_body=({"include_reasoning": include_reasoning} if is_openrouter_base_url() else None),
         )
         raw_payload = resp.model_dump()
         msg = (raw_payload.get("choices") or [{}])[0].get("message")
@@ -300,7 +305,7 @@ def generate_riddle_prompt_options(
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body={"include_reasoning": True} if include_reasoning else {"include_reasoning": False},
+                extra_body=({"include_reasoning": include_reasoning} if is_openrouter_base_url() else None),
             )
             payload2 = resp2.model_dump()
             msg2 = (payload2.get("choices") or [{}])[0].get("message")
@@ -822,11 +827,15 @@ def main() -> None:
     cfg = _load_json(Path(args.config).resolve())
 
     results_root = Path(cfg.get("results_root", REPO_ROOT / "results" / "attacks" / ATTACK_NAME)).resolve()
-    prompt_gen_model = cfg.get("prompt_gen_model", "openai/gpt-5.2")
+    prompt_gen_model = cfg.get("prompt_gen_model", "gpt-5-2-azure-comm-il2")
     prompt_riddle_gen = cfg.get("prompt_riddle_gen", PROMPT_RIDDLE_GEN_DEFAULT)
     prompt_include_reasoning = bool(cfg.get("prompt_include_reasoning", False))
     prompt_gen_bypass = bool(cfg.get("prompt_gen_bypass", False)) or bool(args.bypass_prompt_gen)
     group_by_category = bool(cfg.get("group_by_category", True))
+    # NOTE: image generation (Gemini via OpenRouter) has no equivalent in the LiteLLM
+    # alias roster used elsewhere in this refactor; this default only works when
+    # actually pointed at OpenRouter (or another gateway that exposes an image model
+    # under this name). Override via config.image_model if using a different gateway.
     image_model = cfg.get("image_model", "google/gemini-2.5-flash-image")
     image_config = cfg.get("image_config") or {"size": "1024x1024"}
     runs_per_model = int(cfg.get("runs_per_model", 1))

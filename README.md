@@ -27,7 +27,8 @@ cp .env.example .env
 
 | Key | Required | Used by |
 |-----|----------|---------|
-| `OPENROUTER_API_KEY` | Yes | All attacks and evaluation |
+| `LLM_API_BASE_URL` / `LLM_API_KEY` | Yes (preferred) | All attacks and evaluation. Preferred, gateway-agnostic configuration for any OpenAI-compatible endpoint (e.g. LiteLLM proxy, self-hosted gateway, or OpenRouter). |
+| `OPENROUTER_API_BASE` / `OPENROUTER_API_KEY` | Yes (legacy fallback) | All attacks and evaluation. Legacy env vars for direct OpenRouter usage; still supported for backward compatibility. Resolver checks these if `LLM_API_*` vars are not set. |
 | `REVE_API_KEY` | Optional | Visual replacement data generation |
 | `OLLAMA_API_KEY` | Optional | Ollama-based inference |
 | `HUGGINGFACE_KEY` | Optional | HuggingFace model downloads |
@@ -140,6 +141,12 @@ This scores each VLM reply for safety compliance and writes judge results alongs
 ```bash
 python -m analysis.run_results_summary --results-root results/attacks/<attack_name>
 ```
+
+## Notes & Limitations
+
+**Gateway Flexibility:** This repo now works against any OpenAI-compatible gateway (e.g., a self-hosted LiteLLM proxy, Azure OpenAI, or OpenRouter) rather than being hardcoded to OpenRouter. Use the `LLM_API_BASE_URL` and `LLM_API_KEY` env vars (or legacy `OPENROUTER_API_BASE` / `OPENROUTER_API_KEY`) to point at your preferred endpoint.
+
+**Partial Reproduction Notice:** The paper's original design tests attacks across multiple vendors (Qwen, Grok/xAI, Gemini/Google, Claude/Anthropic, GPT/OpenAI) and uses a 3-vendor judge ensemble to evaluate jailbreak success. If you are running attacks against a limited set of models (e.g., only OpenAI and Anthropic via a LiteLLM gateway) rather than OpenRouter's full multi-vendor catalog, your results will be a partial or adapted reproduction of the paper's original tables. This is expected and not a misconfiguration — the repo is intentionally flexible to support different deployment scenarios.
 
 ## Citation
 

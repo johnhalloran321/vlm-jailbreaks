@@ -224,7 +224,7 @@ def main() -> None:
     parser.add_argument(
         "--models",
         type=str,
-        default="x-ai/grok-4.1-fast,google/gemini-3-flash-preview,anthropic/claude-haiku-4.5",
+        default="gpt-5-2-azure-comm-il2,claude-4-5-sonnet-aws-comm-il2,claude-4-5-haiku-aws-comm-il2",
         help="Comma-separated list of judge model IDs.",
     )
     parser.add_argument("--temperature", type=float, default=0.0)

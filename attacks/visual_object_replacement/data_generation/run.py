@@ -1,22 +1,35 @@
 #!/usr/bin/env python3
 """
-Pipeline to generate base images and run configured attacks using REVE.
+Pipeline to generate base images and run configured attacks via an
+OpenAI-compatible image-gen endpoint (e.g. GPT-5.2 through the Responses
+API's image_generation tool).
 
 Usage:
-  python data_generation/visual_replacement/run.py --config data_generation/visual_replacement/config.json
+  python -m attacks.visual_object_replacement.data_generation.run \
+      --config attacks/visual_object_replacement/data_generation/config.json
 
-Reads a JSON config (see data_generation/visual_replacement/config.json) with:
+Reads a JSON config (see attacks/visual_object_replacement/data_generation/config.json) with:
   - output_root
-  - base_generation settings (count_per_object, model_version)
+  - base_generation settings (count_per_object)
   - objects: list of target object strings
   - attacks: list of attack configs:
         {
           "type": "replace_with_object" | "replace_with_BBBLORK" | "replace_with_nothing",
           "replacements": ["banana", ...]   # only for replace_with_object
-          "model_version": "reve-edit-fast@20251030"
         }
 For each object, generates N base images (via generate_base_image.py) then applies each attack
 on each generated image (via generate_attack_image.py).
+
+This originally shelled out to REVE-backed scripts and (independently of that)
+built its subprocess command paths incorrectly (pointing at a
+data_generation/visual_replacement/ directory that doesn't exist in this
+repo, and passing a plain script path to modules that use relative imports,
+which would fail with "attempted relative import with no known parent
+package"). Both issues are fixed here: subprocess calls now use
+`python -m attacks.visual_object_replacement.data_generation.<module>` run
+from REPO_ROOT, and REVE_API_KEY is no longer required -- image generation
+goes through the same LLM_API_BASE_URL / LLM_API_KEY / IMAGE_GEN_MODEL
+gateway config used by the rest of this repo (see attacks/common/llm_client.py).
 """
 
 import argparse
@@ -29,11 +42,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-MAX_PARALLEL_DEFAULT = 4
+# NOTE: this used to be 4, which silently contradicted the --max-parallel
+# help text ("hard capped at 8") below, since this same constant is used both
+# as the default *and* as the hard cap (`min(args.max_parallel,
+# MAX_PARALLEL_DEFAULT)`) -- a user passing e.g. --max-parallel 8 was
+# silently clamped down to 4. Set to 8 to match the documented behavior and
+# the default used by the rest of the image-gen pipelines (see
+# attacks/common/image_gen.py's DEFAULT_MAX_PARALLEL).
+MAX_PARALLEL_DEFAULT = 8
 MAX_TASK_ATTEMPTS = 3
 
 
@@ -63,16 +83,17 @@ def run_generation_task(
         print(f"[{thread_name}] Launching {description} (attempt {attempt}/{max_attempts})")
         result = None
         try:
-            result = subprocess.run(cmd, env=env)
+            result = subprocess.run(cmd, env=env, cwd=str(REPO_ROOT))
         except Exception as exc:
             print(f"[{thread_name}] {description} raised {exc!r}")
         else:
-            if result.returncode == 0:
+            if result and result.returncode == 0:
                 print(f"[{thread_name}] Completed {description}")
                 return True
-            print(
-                f"[{thread_name}] {description} failed with exit {result.returncode}"
-            )
+            if result:
+                print(
+                    f"[{thread_name}] {description} failed with exit {result.returncode}"
+                )
     failure_tracker.record_failure(description)
     print(f"[{threading.current_thread().name}] Giving up on {description}")
     return False
@@ -81,12 +102,12 @@ def run_generation_task(
 def generate_base_images(
     obj: str,
     count: int,
-    aspect_ratio: str,
-    version: str,
+    model: str,
+    image_api: str,
     extra_prompt: Optional[str],
     output_dir: Path,
     api_key: Optional[str],
-    timeout: int,
+    base_url: Optional[str],
     max_retries: int,
     retry_backoff: int,
     redo_existing: bool,
@@ -104,7 +125,8 @@ def generate_base_images(
             continue
         cmd = [
             sys.executable,
-            str(REPO_ROOT / "data_generation/visual_replacement/generate_base_image.py"),
+            "-m",
+            "attacks.visual_object_replacement.data_generation.generate_base_image",
             obj,
         ]
         if extra_prompt:
@@ -112,12 +134,10 @@ def generate_base_images(
         cmd += [
             "--output",
             str(output_path),
-            "--aspect-ratio",
-            aspect_ratio,
-            "--version",
-            version,
-            "--timeout",
-            str(timeout),
+            "--model",
+            model,
+            "--image-api",
+            image_api,
             "--max-retries",
             str(max_retries),
             "--retry-backoff",
@@ -127,7 +147,9 @@ def generate_base_images(
             cmd += ["--attack-type", attack_type]
         env = os.environ.copy()
         if api_key:
-            env["REVE_API_KEY"] = api_key
+            env["LLM_API_KEY"] = api_key
+        if base_url:
+            env["LLM_API_BASE_URL"] = base_url
         description = f"BASE {obj} #{i} ({output_path.name})"
         futures.append(
             executor.submit(
@@ -147,9 +169,10 @@ def run_attack(
     original_object: str,
     source_image: Path,
     output_path: Path,
-    aspect_ratio: str,
-    version: str,
+    model: str,
+    image_api: str,
     api_key: Optional[str],
+    base_url: Optional[str],
     replacement_object: Optional[str] = None,
     executor: ThreadPoolExecutor = None,
     failure_tracker: FailureTracker = None,
@@ -157,7 +180,8 @@ def run_attack(
 ):
     cmd = [
         sys.executable,
-        str(REPO_ROOT / "data_generation/visual_replacement/generate_attack_image.py"),
+        "-m",
+        "attacks.visual_object_replacement.data_generation.generate_attack_image",
         str(source_image),
         "--attack-type",
         attack_type,
@@ -165,17 +189,19 @@ def run_attack(
         original_object,
         "--output",
         str(output_path),
-        "--aspect-ratio",
-        aspect_ratio,
-        "--version",
-        version,
+        "--model",
+        model,
+        "--image-api",
+        image_api,
     ]
     if replacement_object:
         cmd += ["--replacement-object", replacement_object]
 
     env = os.environ.copy()
     if api_key:
-        env["REVE_API_KEY"] = api_key
+        env["LLM_API_KEY"] = api_key
+    if base_url:
+        env["LLM_API_BASE_URL"] = base_url
     attack_label = f"{attack_type}:{replacement_object}" if replacement_object else attack_type
     description = f"ATTACK {attack_label} on {source_image.name}"
     return executor.submit(
@@ -193,7 +219,10 @@ def run_attacks_for_object(
     base_images_dir: Path,
     attacks_config: list,
     output_root: Path,
+    model: str,
+    image_api: str,
     api_key: Optional[str],
+    base_url: Optional[str],
     redo_existing: bool,
     executor: ThreadPoolExecutor,
     failure_tracker: FailureTracker,
@@ -203,8 +232,9 @@ def run_attacks_for_object(
     for img_path in sorted(base_images_dir.glob("*.png")):
         for attack in attacks_config:
             attack_type = attack["type"]
-            aspect_ratio = "16:9"
-            version = attack.get("model_version", "reve-edit-fast@20251030")
+            # attack.get("model_version") is a leftover REVE-specific knob
+            # (e.g. "reve-edit-fast@20251030"); ignored now that image editing
+            # goes through --model / --image-api instead.
 
             if attack_type == "replace_with_object":
                 replacements = attack.get("replacements", [])
@@ -224,9 +254,10 @@ def run_attacks_for_object(
                             original_object=obj,
                             source_image=img_path,
                             output_path=output_path,
-                            aspect_ratio=aspect_ratio,
-                            version=version,
+                            model=model,
+                            image_api=image_api,
                             api_key=api_key,
+                            base_url=base_url,
                             replacement_object=repl,
                             executor=executor,
                             failure_tracker=failure_tracker,
@@ -251,9 +282,10 @@ def run_attacks_for_object(
                             original_object=obj,
                             source_image=img_path,
                             output_path=output_path,
-                            aspect_ratio=aspect_ratio,
-                            version=version,
+                            model=model,
+                            image_api=image_api,
                             api_key=api_key,
+                            base_url=base_url,
                             replacement_object=repl,
                             executor=executor,
                             failure_tracker=failure_tracker,
@@ -273,9 +305,10 @@ def run_attacks_for_object(
                         original_object=obj,
                         source_image=img_path,
                         output_path=output_path,
-                        aspect_ratio=aspect_ratio,
-                        version=version,
+                        model=model,
+                        image_api=image_api,
                         api_key=api_key,
+                        base_url=base_url,
                         executor=executor,
                         failure_tracker=failure_tracker,
                         task_attempts=task_attempts,
@@ -289,21 +322,29 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default=str(REPO_ROOT / "data_generation/visual_replacement/config.json"),
+        default=str(REPO_ROOT / "attacks/visual_object_replacement/data_generation/config.json"),
         help="Path to pipeline config JSON.",
     )
-    parser.add_argument("--api-key", type=str, default=None, help="REVE API key (overrides env).")
     parser.add_argument(
-        "--timeout",
-        type=int,
-        default=120,
-        help="Create request timeout (seconds).",
+        "--model",
+        type=str,
+        default=os.environ.get("IMAGE_GEN_MODEL", "openai/gpt-5.2"),
+        help="Image-gen model name (default: $IMAGE_GEN_MODEL or openai/gpt-5.2).",
     )
+    parser.add_argument(
+        "--image-api",
+        type=str,
+        default="auto",
+        choices=["auto", "chat", "responses"],
+        help="API shape to use for image generation/editing (see attacks/common/image_gen.py).",
+    )
+    parser.add_argument("--api-key", type=str, default=None, help="LLM gateway API key (overrides LLM_API_KEY env).")
+    parser.add_argument("--base-url", type=str, default=None, help="LLM gateway base URL (overrides LLM_API_BASE_URL env).")
     parser.add_argument(
         "--max-retries",
         type=int,
         default=3,
-        help="Max retries for create requests.",
+        help="Max retries for generation requests.",
     )
     parser.add_argument(
         "--retry-backoff",
@@ -333,13 +374,17 @@ def main():
     attacks = cfg["attacks"]
 
     base_count = base_cfg.get("count_per_object", 5)
-    base_aspect = "16:9"
-    base_version = base_cfg.get("model_version", "reve-create@20250915")
+    # base_cfg.get("model_version") is a leftover REVE-specific knob (e.g.
+    # "reve-create@20250915"); ignored now -- use --model / $IMAGE_GEN_MODEL instead.
     extra_prompt = None
 
-    api_key = args.api_key or os.environ.get("REVE_API_KEY")
-    if not api_key:
-        raise SystemExit("REVE_API_KEY not set. Provide --api-key or export REVE_API_KEY.")
+    api_key = args.api_key or os.environ.get("LLM_API_KEY")
+    base_url = args.base_url or os.environ.get("LLM_API_BASE_URL")
+    if not api_key and not os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("OLLAMA_API_KEY"):
+        raise SystemExit(
+            "No LLM API key found. Provide --api-key or export LLM_API_KEY "
+            "(see attacks/common/llm_client.py for the full resolution order)."
+        )
 
     base_output_root = output_root / "base"
     attack_output_root = output_root / "attacks"
@@ -361,12 +406,12 @@ def main():
                 generate_base_images(
                     obj=obj,
                     count=base_count,
-                    aspect_ratio=base_aspect,
-                    version=base_version,
+                    model=args.model,
+                    image_api=args.image_api,
                     extra_prompt=extra_prompt,
                     output_dir=obj_base_dir,
                     api_key=api_key,
-                    timeout=args.timeout,
+                    base_url=base_url,
                     max_retries=args.max_retries,
                     retry_backoff=args.retry_backoff,
                     redo_existing=args.redo_existing,
@@ -389,7 +434,10 @@ def main():
                     base_images_dir=obj_base_dir,
                     attacks_config=attacks,
                     output_root=attack_output_root,
+                    model=args.model,
+                    image_api=args.image_api,
                     api_key=api_key,
+                    base_url=base_url,
                     redo_existing=args.redo_existing,
                     executor=executor,
                     failure_tracker=failure_tracker,

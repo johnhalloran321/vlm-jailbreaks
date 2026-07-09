@@ -28,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from attacks.common.llm_client import resolve_api_key
 from attacks.common.ollama_inference import analyze_multiple_images_ollama
 from attacks.common.openrouter_inference import analyze_multiple_images_openrouter
 
@@ -312,10 +313,13 @@ def run_attack_for_behavior(
             verbose=not quiet,
         )
     elif provider == "openrouter":
-        resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        resolved_key = resolve_api_key(api_key)
         if not resolved_key:
-            raise ValueError("OPENROUTER_API_KEY not provided")
-        
+            raise ValueError(
+                "No API key found. Set LLM_API_KEY (preferred) or OPENROUTER_API_KEY, "
+                "or pass api_key explicitly."
+            )
+
         response = analyze_multiple_images_openrouter(
             image_paths=image_paths,
             prompt=prompt,

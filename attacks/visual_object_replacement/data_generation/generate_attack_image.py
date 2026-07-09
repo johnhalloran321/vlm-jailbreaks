@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """
-Generate an edited image via the REVE API and save a side-by-side comparison.
+Generate an edited (attack) image via an OpenAI-compatible image-gen endpoint
+and save the result.
+
+This originally called REVE's /v1/image/edit endpoint directly. This repo
+doesn't have REVE access, so it now goes through the shared
+attacks/common/image_gen.py request_image_edit() helper, which sends the
+source image + edit instruction as multimodal input to either:
+  - the Responses API's image_generation tool (required for OpenAI GPT-5.x), or
+  - legacy chat.completions with image_url content parts (Gemini-style),
+picked automatically from --model, or forced via --image-api.
 """
 
 import argparse
-import base64
-import json
 import os
 import sys
 from io import BytesIO
 from pathlib import Path
 
-import requests
 from PIL import Image
 
-from .prompts import (
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from attacks.common.llm_client import get_client  # noqa: E402
+from attacks.common.image_gen import request_image_edit_with_retry  # noqa: E402
+from .prompts import (  # noqa: E402
     EDIT_BBBLORK_TEMPLATE,
     EDIT_TEMPLATE,
     EDIT_TEXT_TEMPLATE,
@@ -22,69 +34,59 @@ from .prompts import (
 )
 
 
-def image_to_base64(image_path: Path) -> str:
-    """Read an image file and return base64 string."""
-    with image_path.open("rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
-
-
-def decode_base64_image(data: str) -> Image.Image:
-    """Decode a base64 image string (data URLs supported)."""
-    if "," in data and data.strip().startswith("data:"):
-        data = data.split(",", 1)[1]
-    return Image.open(BytesIO(base64.b64decode(data))).convert("RGB")
-
-
-def request_reve_edit(
-    image_path: Path,
-    edit_instruction: str,
-    api_key: str,
-    aspect_ratio: str = None,
-    version: str = "latest",
-) -> dict:
-    """Call REVE edit API and return parsed JSON response."""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "edit_instruction": edit_instruction,
-        "reference_image": image_to_base64(image_path),
-        "version": version,
-    }
-    if aspect_ratio:
-        payload["aspect_ratio"] = aspect_ratio
-
-    response = requests.post(
-        "https://api.reve.com/v1/image/edit", headers=headers, json=payload, timeout=60
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        detail = None
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
-        raise SystemExit(f"Request failed: {exc}\nDetails: {detail}") from exc
-
-    try:
-        return response.json()
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"Failed to parse response: {exc}\nRaw: {response.text}") from exc
-
-
-def save_image(edited_image: Image.Image, output_path: Path):
-    """Save edited image to disk."""
+def save_image_bytes(image_bytes: bytes, output_path: Path) -> Image.Image:
+    """Decode raw image bytes and save to disk."""
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    edited_image.save(output_path)
+    image.save(output_path)
+    return image
+
+
+def generate_attack_image(
+    image_path: Path,
+    prompt: str,
+    client,
+    model: str,
+    output_path: Path,
+    api_style: str = "auto",
+    max_retries: int = 3,
+    backoff: int = 2,
+) -> Path:
+    """Request a single image edit, retrying transient failures.
+
+    Delegates to ``request_image_edit_with_retry()`` (see
+    attacks/common/image_gen.py), which honors a server-provided
+    ``Retry-After`` header on HTTP 429 rate-limit responses and falls back to
+    exponential backoff with jitter otherwise.
+    """
+
+    def _on_retry(attempt: int, exc: BaseException, wait: float) -> None:
+        print(
+            f"Image edit failed (attempt {attempt + 1}/{max_retries + 1}): {exc}. Retrying in {wait:.1f}s...",
+            flush=True,
+        )
+
+    try:
+        images = request_image_edit_with_retry(
+            client,
+            model=model,
+            prompt=prompt,
+            images=image_path,
+            api_style=api_style,
+            max_retries=max_retries - 1 if max_retries > 0 else 0,
+            backoff_base=float(backoff),
+            on_retry=_on_retry,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"Image edit failed after {max_retries} attempts: {exc}") from exc
+
+    save_image_bytes(images[0], output_path)
+    return output_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Edit an image with REVE and save a side-by-side comparison."
+        description="Edit an image via an OpenAI-compatible image-gen endpoint and save the result."
     )
     parser.add_argument("image_path", type=str, help="Path to the source image to edit.")
     parser.add_argument(
@@ -117,21 +119,45 @@ def main():
         "-o",
         type=str,
         default=None,
-        help="Output path for side-by-side image (default: ./tmp/<input>_reve_edit.jpg).",
+        help="Output path for the edited image (default: ./tmp/<input>_attack.jpg).",
     )
-    parser.add_argument("--api-key", type=str, default=None, help="REVE API key.")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=os.environ.get("IMAGE_GEN_MODEL", "openai/gpt-5.2"),
+        help="Image-gen model name (default: $IMAGE_GEN_MODEL or openai/gpt-5.2).",
+    )
+    parser.add_argument(
+        "--image-api",
+        type=str,
+        default="auto",
+        choices=["auto", "chat", "responses"],
+        help=(
+            "API shape to use for image editing. 'chat' = legacy chat.completions with "
+            "image_url content parts + response_format={'type':'image'} (OpenRouter-style "
+            "image models, e.g. Gemini image). 'responses' = Responses API + image_generation "
+            "tool with input_image content blocks (required for OpenAI GPT-5.x image editing). "
+            "'auto' (default) guesses from --model (gpt-5* -> responses, else chat)."
+        ),
+    )
+    parser.add_argument("--api-key", type=str, default=None, help="API key override (else LLM_API_KEY / etc.).")
+    parser.add_argument("--base-url", type=str, default=None, help="Base URL override (else LLM_API_BASE_URL / etc.).")
+    # --aspect-ratio / --version kept only for CLI compatibility with the old
+    # REVE-based invocation (run.py still passes them); unused now.
     parser.add_argument(
         "--aspect-ratio",
         type=str,
         default="16:9",
-        help="Aspect ratio for output image (default: 16:9). Valid: 16:9, 3:2, 4:3, 1:1, 3:4, 2:3, 9:16.",
+        help="(Unused with the GPT-5.2 image-gen path; kept for CLI compatibility.)",
     )
     parser.add_argument(
         "--version",
         type=str,
-        default="reve-edit-fast@20251030",
-        help="REVE model version to use (default: reve-edit-fast@20251030).",
+        default=None,
+        help="(Unused with the GPT-5.2 image-gen path; use --model instead.)",
     )
+    parser.add_argument("--max-retries", type=int, default=3, help="Max retries on failure (default: 3).")
+    parser.add_argument("--retry-backoff", type=int, default=2, help="Exponential backoff base in seconds (default: 2).")
 
     args = parser.parse_args()
 
@@ -139,9 +165,7 @@ def main():
     if not source_path.exists():
         raise FileNotFoundError(f"Image not found: {source_path}")
 
-    api_key = args.api_key or os.environ.get("REVE_API_KEY")
-    if not api_key:
-        raise ValueError("REVE_API_KEY not set. Provide --api-key or export REVE_API_KEY.")
+    client = get_client(api_key=args.api_key, base_url=args.base_url)
 
     # Build prompt based on attack type
     attack_type = args.attack_type
@@ -175,38 +199,22 @@ def main():
 
     prompt = f"{base_prompt} {args.prompt}" if args.prompt else base_prompt
 
-    # Aspect ratio passed through (default 16:9; must be one of allowed ratios per API)
-    aspect_ratio = args.aspect_ratio
-
-    try:
-        result = request_reve_edit(
-            image_path=source_path,
-            edit_instruction=prompt,
-            api_key=api_key,
-            aspect_ratio=aspect_ratio,
-            version=args.version,
-        )
-    except requests.RequestException as exc:
-        raise SystemExit(f"Request failed: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"Failed to parse response: {exc}") from exc
-
-    edited_b64 = result.get("image")
-    if not edited_b64:
-        raise SystemExit("No edited image returned from REVE response.")
-
-    edited_image = decode_base64_image(edited_b64)
-    default_out = source_path.with_name(f"{source_path.stem}_reve_edit{source_path.suffix or '.jpg'}")
+    default_out = source_path.with_name(f"{source_path.stem}_attack{source_path.suffix or '.jpg'}")
     output_path = Path(args.output) if args.output else Path("./tmp") / default_out.name
 
-    save_image(edited_image, output_path)
+    generate_attack_image(
+        image_path=source_path,
+        prompt=prompt,
+        client=client,
+        model=args.model,
+        output_path=output_path,
+        api_style=args.image_api,
+        max_retries=args.max_retries,
+        backoff=args.retry_backoff,
+    )
 
-    print(f"Request ID: {result.get('request_id')}")
-    print(f"Credits used: {result.get('credits_used')}")
-    print(f"Credits remaining: {result.get('credits_remaining')}")
-    if result.get("content_violation"):
-        print("Warning: Content policy violation detected.")
-    print(f"Side-by-side saved to: {output_path}")
+    print(f"Prompt used: {prompt}")
+    print(f"Edited image saved to: {output_path}")
 
 
 if __name__ == "__main__":

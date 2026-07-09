@@ -1,8 +1,7 @@
 {
     "output_root": "./data/visual_replacement_noun",
     "base_generation": {
-        "count_per_object": 3,
-        "model_version": "reve-create@20250915"
+        "count_per_object": 3
     },
     "objects": [
         "dimethylmercury",
@@ -210,8 +209,7 @@
             "type": "text_replacement",
             "replacements": [
                 "banana"
-            ],
-            "model_version": "latest"
+            ]
         }
     ]
 }

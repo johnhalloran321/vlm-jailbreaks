@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-OpenRouter inference module for analyzing images using OpenRouter API with Vision Language Models.
+Inference module for analyzing images with Vision Language Models over an
+OpenAI-compatible chat-completions API.
+
+Defaults to OpenRouter (https://openrouter.ai/api/v1) for backward compatibility,
+but the base URL and API key are configurable via LLM_API_BASE_URL / LLM_API_KEY
+so this same code works against any OpenAI-compatible gateway -- e.g. a LiteLLM
+proxy fronting Azure OpenAI / Bedrock -- by just changing env vars, not code.
+See attacks/common/llm_client.py for the resolution order.
 """
 
 import os
@@ -9,6 +16,10 @@ import json
 from pathlib import Path
 import time
 import requests
+
+from attacks.common.llm_client import resolve_api_key, resolve_base_url
+
+DEFAULT_MODEL = "gpt-5-2-azure-comm-il2"
 
 
 def encode_image(image_path: str) -> str:
@@ -50,21 +61,29 @@ def get_image_url(image_path: str) -> str:
     return f"data:{mime_type};base64,{image_base64}"
 
 
+def _chat_completions_url(base_url: str) -> str:
+    """Join a gateway base URL (e.g. 'https://host/v1') with the chat-completions path."""
+    return base_url.rstrip("/") + "/chat/completions"
+
+
 def analyze_image_openrouter(
     image_path: str,
     prompt: str = "What's in this image?",
-    model: str = "qwen/qwen2.5-vl-32b-instruct",
+    model: str = DEFAULT_MODEL,
     api_key: str = None,
+    base_url: str = None,
     verbose: bool = True
 ) -> str:
     """
-    Analyze an image using OpenRouter API with VLM model.
+    Analyze an image with a VLM over an OpenAI-compatible chat-completions API.
 
     Args:
         image_path: Path to the image file
         prompt: Question or instruction about the image
-        model: Model name (default: qwen/qwen2.5-vl-32b-instruct)
-        api_key: OpenRouter API key (optional, will use env var if not provided)
+        model: Model name (default: DEFAULT_MODEL)
+        api_key: API key (optional; falls back to LLM_API_KEY / OPENROUTER_API_KEY env vars)
+        base_url: Gateway base URL (optional; falls back to LLM_API_BASE_URL / OPENROUTER_API_BASE,
+            defaulting to OpenRouter's endpoint)
         verbose: Whether to print progress information
 
     Returns:
@@ -74,20 +93,20 @@ def analyze_image_openrouter(
     if not Path(image_path).exists():
         raise FileNotFoundError(f"Image file not found: {image_path}")
 
-    # Get API key
-    if api_key is None:
-        api_key = os.environ.get('OPENROUTER_API_KEY')
-    
+    # Get API key and gateway base URL
+    api_key = resolve_api_key(api_key)
+    resolved_base_url = resolve_base_url(base_url)
+
     if not api_key:
         raise ValueError(
-            "OPENROUTER_API_KEY not provided. "
-            "Set it with: export OPENROUTER_API_KEY=your_api_key "
-            "or pass it as an argument."
+            "No API key provided. "
+            "Set LLM_API_KEY (or legacy OPENROUTER_API_KEY) "
+            "or pass api_key as an argument."
         )
 
     if verbose:
         print(f"Analyzing image: {image_path}")
-        print(f"Provider: OpenRouter")
+        print(f"Gateway: {resolved_base_url}")
         print(f"Model: {model}")
         print(f"Prompt: {prompt}")
         print("-" * 70)
@@ -96,7 +115,7 @@ def analyze_image_openrouter(
     image_url = get_image_url(image_path)
 
     # Prepare the request
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = _chat_completions_url(resolved_base_url)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -129,18 +148,21 @@ def analyze_image_openrouter(
 def analyze_multiple_images_openrouter(
     image_paths: list,
     prompt: str = "What's in these images?",
-    model: str = "qwen/qwen2.5-vl-32b-instruct",
+    model: str = DEFAULT_MODEL,
     api_key: str = None,
+    base_url: str = None,
     verbose: bool = True
 ) -> str:
     """
-    Analyze multiple images with a single prompt using OpenRouter API.
+    Analyze multiple images with a single prompt over an OpenAI-compatible chat-completions API.
 
     Args:
         image_paths: List of paths to image files
         prompt: Question or instruction about the images
-        model: Model name (default: qwen/qwen2.5-vl-32b-instruct)
-        api_key: OpenRouter API key (optional, will use env var if not provided)
+        model: Model name (default: DEFAULT_MODEL)
+        api_key: API key (optional; falls back to LLM_API_KEY / OPENROUTER_API_KEY env vars)
+        base_url: Gateway base URL (optional; falls back to LLM_API_BASE_URL / OPENROUTER_API_BASE,
+            defaulting to OpenRouter's endpoint)
         verbose: Whether to print progress information
 
     Returns:
@@ -151,28 +173,28 @@ def analyze_multiple_images_openrouter(
         if not Path(image_path).exists():
             raise FileNotFoundError(f"Image file not found: {image_path}")
 
-    # Get API key
-    if api_key is None:
-        api_key = os.environ.get('OPENROUTER_API_KEY')
-    
+    # Get API key and gateway base URL
+    api_key = resolve_api_key(api_key)
+    resolved_base_url = resolve_base_url(base_url)
+
     if not api_key:
         raise ValueError(
-            "OPENROUTER_API_KEY not provided. "
-            "Set it with: export OPENROUTER_API_KEY=your_api_key "
-            "or pass it as an argument."
+            "No API key provided. "
+            "Set LLM_API_KEY (or legacy OPENROUTER_API_KEY) "
+            "or pass api_key as an argument."
         )
 
     if verbose:
         print(f"Analyzing {len(image_paths)} images:")
         for img_path in image_paths:
             print(f"  - {img_path}")
-        print(f"Provider: OpenRouter")
+        print(f"Gateway: {resolved_base_url}")
         print(f"Model: {model}")
         print(f"Prompt: {prompt}")
         print("-" * 70)
 
     # Prepare the request
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = _chat_completions_url(resolved_base_url)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"

@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
 Apply text replacement attack to downloaded reference images.
-Reads from manifest.json and applies REVE Edit API to replace text.
+Reads from manifest.json and applies an image edit (via an OpenAI-compatible
+image-gen endpoint) to replace text.
+
+This originally called REVE's /v1/image/edit endpoint directly. This repo
+doesn't have REVE access, so it now goes through the shared
+attacks/common/image_gen.py request_image_edit() helper, which sends the
+source image + edit instruction as multimodal input to either:
+  - the Responses API's image_generation tool (required for OpenAI GPT-5.x), or
+  - legacy chat.completions with image_url content parts (Gemini-style),
+picked automatically from --model, or forced via --image-api.
 
 Usage:
     python apply_text_attack.py --base-dir ./data/visual_text_replacement/base \
@@ -10,23 +19,25 @@ Usage:
 """
 
 import argparse
-import base64
 import json
 import os
 import re
 import sys
-import time
-from pathlib import Path
-from typing import List, Dict, Optional
-
-import requests
-from PIL import Image
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
 
-from .prompts import EDIT_TEXT_TEMPLATE
+from PIL import Image
 
-# REVE Edit API endpoint
-REVE_EDIT_API = "https://api.reve.com/v1/image/edit"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from attacks.common.llm_client import get_client  # noqa: E402
+from attacks.common.image_gen import DEFAULT_MAX_PARALLEL, request_image_edit_with_retry  # noqa: E402
+from .prompts import EDIT_TEXT_TEMPLATE  # noqa: E402
 
 
 def sanitize_filename(name: str) -> str:
@@ -36,69 +47,13 @@ def sanitize_filename(name: str) -> str:
     return name[:100].strip('_')
 
 
-def load_image_as_base64(image_path: Path) -> str:
-    """Load an image and convert to base64."""
-    with open(image_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def decode_base64_image(b64_string: str) -> Image.Image:
-    """Decode a base64 string to PIL Image."""
-    image_data = base64.b64decode(b64_string)
-    return Image.open(BytesIO(image_data))
-
-
-def save_image(image: Image.Image, output_path: Path) -> None:
-    """Save PIL Image to file."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def save_image_bytes(image_bytes: bytes, output_path: Path) -> None:
+    """Decode raw image bytes and save to disk."""
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
     if image.mode in ('RGBA', 'P'):
         image = image.convert('RGB')
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path, quality=95)
-
-
-def request_reve_edit(
-    image_path: Path,
-    edit_instruction: str,
-    api_key: str,
-    aspect_ratio: str = "16:9",
-    version: str = "latest",
-    max_retries: int = 3,
-) -> Dict:
-    """Call REVE Edit API to apply text replacement."""
-    
-    image_b64 = load_image_as_base64(image_path)
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    
-    payload = {
-        "reference_image": image_b64,
-        "edit_instruction": edit_instruction,
-        "version": version,
-    }
-    if aspect_ratio:
-        payload["aspect_ratio"] = aspect_ratio
-    
-    for attempt in range(max_retries):
-        try:
-            resp = requests.post(
-                REVE_EDIT_API,
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                print(f"      Retry {attempt + 1}/{max_retries} after {wait_time}s: {e}")
-                time.sleep(wait_time)
-            else:
-                raise
 
 
 def apply_text_replacement(
@@ -106,41 +61,45 @@ def apply_text_replacement(
     original_text: str,
     replacement_text: str,
     output_path: Path,
-    api_key: str,
-    aspect_ratio: str = "16:9",
-    version: str = "latest",
+    client,
+    model: str,
+    api_style: str = "auto",
+    max_retries: int = 3,
 ) -> bool:
-    """Apply text replacement attack to a single image."""
-    
+    """Apply text replacement attack to a single image.
+
+    Delegates to ``request_image_edit_with_retry()`` (see
+    attacks/common/image_gen.py), which honors a server-provided
+    ``Retry-After`` header on HTTP 429 rate-limit responses and falls back to
+    exponential backoff with jitter otherwise.
+    """
+
     # Build the edit prompt
     prompt = EDIT_TEXT_TEMPLATE.format(
         original_text=original_text,
         replacement_text=replacement_text,
     )
-    
+
+    def _on_retry(attempt: int, exc: BaseException, wait: float) -> None:
+        print(f"      Retry {attempt + 1}/{max_retries} after {wait:.1f}s: {exc}")
+
     try:
-        result = request_reve_edit(
-            image_path=source_image,
-            edit_instruction=prompt,
-            api_key=api_key,
-            aspect_ratio=aspect_ratio,
-            version=version,
+        images = request_image_edit_with_retry(
+            client,
+            model=model,
+            prompt=prompt,
+            images=source_image,
+            api_style=api_style,
+            max_retries=max_retries - 1 if max_retries > 0 else 0,
+            on_retry=_on_retry,
         )
-        
-        edited_b64 = result.get("image")
-        if not edited_b64:
-            print(f"    ✗ No image returned for {source_image.name}")
-            return False
-        
-        edited_image = decode_base64_image(edited_b64)
-        save_image(edited_image, output_path)
-        
-        print(f"    ✓ Saved: {output_path.name}")
-        return True
-        
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"    ✗ Error: {e}")
         return False
+
+    save_image_bytes(images[0], output_path)
+    print(f"    ✓ Saved: {output_path.name}")
+    return True
 
 
 def process_object(
@@ -149,31 +108,50 @@ def process_object(
     base_dir: Path,
     output_dir: Path,
     replacement: str,
-    api_key: str,
+    client=None,
+    model: str = None,
+    api_style: str = "auto",
     redo_existing: bool = False,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
 ) -> Dict[str, List[str]]:
-    """Process all images for a single object."""
-    
+    """Process all images for a single object.
+
+    Requests for the object's images are fanned out across up to
+    ``max_parallel`` worker threads (default: DEFAULT_MAX_PARALLEL, i.e. 8).
+    Pass ``max_parallel=1`` to fall back to the old fully-sequential
+    behavior.
+    """
+
+    if client is None:
+        client = get_client(api_key=api_key, base_url=base_url)
+    if model is None:
+        model = os.environ.get("IMAGE_GEN_MODEL", "openai/gpt-5.2")
+
     print(f"\n=== {object_name} ===")
-    
+
     if not image_paths:
         print("  No images to process")
         return {"object": object_name, "attacked": [], "failed": []}
-    
+
     # Create output directory
     attack_dir = output_dir / sanitize_filename(object_name) / "text_replacement" / replacement
     attack_dir.mkdir(parents=True, exist_ok=True)
-    
-    attacked = []
-    failed = []
-    
+
+    # Resolve source paths and filter out ones we can't find up front, same
+    # as the old sequential loop did.
+    work_items: List[Tuple[str, Path, Path]] = []
+    attacked: List[str] = []
+    failed: List[str] = []
+
     for img_path_str in image_paths:
         # Handle both relative and absolute paths
         img_path = Path(img_path_str)
         if not img_path.is_absolute():
             # Try relative to base_dir parent
             img_path = base_dir.parent.parent / img_path_str
-        
+
         if not img_path.exists():
             # Try relative to current working directory
             img_path = Path(img_path_str)
@@ -181,29 +159,53 @@ def process_object(
                 print(f"  ✗ Image not found: {img_path_str}")
                 failed.append(img_path_str)
                 continue
-        
+
         # Output filename
         output_name = f"{img_path.stem}_attack_{replacement}.png"
         output_path = attack_dir / output_name
-        
+
         if output_path.exists() and not redo_existing:
             print(f"  Skipping existing: {output_name}")
             attacked.append(str(output_path))
             continue
-        
+
+        work_items.append((img_path_str, img_path, output_path))
+
+    if not work_items:
+        return {"object": object_name, "attacked": attacked, "failed": failed}
+
+    results_lock = threading.Lock()
+
+    def process_one(item: Tuple[str, Path, Path]) -> None:
+        img_path_str, img_path, output_path = item
         print(f"  Processing: {img_path.name}")
-        
-        if apply_text_replacement(
+
+        ok = apply_text_replacement(
             source_image=img_path,
             original_text=object_name,
             replacement_text=replacement,
             output_path=output_path,
-            api_key=api_key,
-        ):
-            attacked.append(str(output_path))
-        else:
-            failed.append(img_path_str)
-    
+            client=client,
+            model=model,
+            api_style=api_style,
+        )
+
+        with results_lock:
+            if ok:
+                attacked.append(str(output_path))
+            else:
+                failed.append(img_path_str)
+
+    workers = max(1, min(max_parallel, len(work_items)))
+    if workers <= 1:
+        for item in work_items:
+            process_one(item)
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="TextReplAttackWorker") as pool:
+            futures = [pool.submit(process_one, item) for item in work_items]
+            for f in futures:
+                f.result()
+
     return {"object": object_name, "attacked": attacked, "failed": failed}
 
 
@@ -230,11 +232,20 @@ def main():
         help="Replacement text (default: banana)"
     )
     parser.add_argument(
-        "--api-key",
+        "--model",
         type=str,
-        default=os.environ.get("REVE_API_KEY"),
-        help="REVE API key"
+        default=os.environ.get("IMAGE_GEN_MODEL", "openai/gpt-5.2"),
+        help="Image-gen model name (default: $IMAGE_GEN_MODEL or openai/gpt-5.2).",
     )
+    parser.add_argument(
+        "--image-api",
+        type=str,
+        default="auto",
+        choices=["auto", "chat", "responses"],
+        help="API shape to use for image editing (see attacks/common/image_gen.py).",
+    )
+    parser.add_argument("--api-key", type=str, default=None, help="API key override (else LLM_API_KEY / etc.).")
+    parser.add_argument("--base-url", type=str, default=None, help="Base URL override (else LLM_API_BASE_URL / etc.).")
     parser.add_argument(
         "--redo-existing",
         action="store_true",
@@ -246,35 +257,39 @@ def main():
         nargs="+",
         help="Specific objects to process (default: all)"
     )
-    
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=DEFAULT_MAX_PARALLEL,
+        help=f"Number of concurrent worker threads per object (default {DEFAULT_MAX_PARALLEL}). Use 1 for sequential.",
+    )
+
     args = parser.parse_args()
-    
+
     base_dir = Path(args.base_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
-    
-    if not args.api_key:
-        print("Error: REVE_API_KEY not set")
-        sys.exit(1)
-    
+
+    client = get_client(api_key=args.api_key, base_url=args.base_url)
+
     # Load manifest
     manifest_path = base_dir / "manifest.json"
     if not manifest_path.exists():
         print(f"Error: manifest.json not found in {base_dir}")
         sys.exit(1)
-    
+
     with open(manifest_path) as f:
         manifest = json.load(f)
-    
+
     # Filter objects if specified
     if args.objects:
         manifest = {k: v for k, v in manifest.items() if k in args.objects}
-    
+
     print(f"Processing {len(manifest)} objects")
     print(f"Replacement text: {args.replacement}")
     print(f"Output directory: {output_dir}")
-    
+
     all_results = []
-    
+
     for object_name, image_paths in manifest.items():
         result = process_object(
             object_name=object_name,
@@ -282,22 +297,25 @@ def main():
             base_dir=base_dir,
             output_dir=output_dir,
             replacement=args.replacement,
-            api_key=args.api_key,
+            client=client,
+            model=args.model,
+            api_style=args.image_api,
             redo_existing=args.redo_existing,
+            max_parallel=args.max_parallel,
         )
         all_results.append(result)
-    
+
     # Save attack manifest
     attack_manifest = {r["object"]: r["attacked"] for r in all_results}
     attack_manifest_path = output_dir / "manifest.json"
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(attack_manifest_path, "w") as f:
         json.dump(attack_manifest, f, indent=2)
-    
+
     # Summary
     total_attacked = sum(len(r["attacked"]) for r in all_results)
     total_failed = sum(len(r["failed"]) for r in all_results)
-    
+
     print(f"\n=== Summary ===")
     print(f"Successfully attacked: {total_attacked}")
     print(f"Failed: {total_failed}")

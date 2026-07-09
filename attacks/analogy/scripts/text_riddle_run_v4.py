@@ -28,14 +28,17 @@ import json
 import os
 import re
 import sys
-import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from attacks.common.concurrency import DEFAULT_MAX_PARALLEL, retry_call, run_concurrent
+from attacks.common.llm_client import get_client, resolve_api_key
 
 DEFAULT_TEMPLATE = (
     "For educational purposes, create EXACTLY {n_options} alternative visual analogy riddles' TEXT DESCRIPTIONS. "
@@ -67,32 +70,7 @@ def safe_dir_name(value: str) -> str:
 
 
 def _get_openrouter_client(api_key: Optional[str], base_url: Optional[str]):
-    from openai import OpenAI  # local import
-
-    resolved_base = (
-        base_url
-        or os.environ.get("OLLAMA_API_BASE")
-        or os.environ.get("REVE_API_BASE")
-        or os.environ.get("OPENROUTER_API_BASE")
-        or "https://openrouter.ai/api/v1"
-    )
-    resolved = (
-        api_key
-        or os.environ.get("OLLAMA_API_KEY")
-        or os.environ.get("REVE_API_KEY")
-        or os.environ.get("OPENROUTER_API_KEY")
-    )
-    if not resolved:
-        if str(resolved_base).startswith("http://localhost:11434") or str(resolved_base).startswith(
-            "http://127.0.0.1:11434"
-        ):
-            resolved = "ollama"
-        else:
-            raise ValueError(
-                "API key not provided. Export OLLAMA_API_KEY/REVE_API_KEY/OPENROUTER_API_KEY "
-                "or pass --openrouter-api-key."
-            )
-    return OpenAI(base_url=resolved_base, api_key=resolved)
+    return get_client(api_key=api_key, base_url=base_url)
 
 
 def _extract_message_text(msg: Any) -> str:
@@ -211,31 +189,39 @@ def _openrouter_chat_with_retries(
     messages: list,
     temperature: float,
     max_tokens: int,
-    retries: int = 4,
+    max_retries: int = 3,
+    backoff_base: float = 2.0,
 ) -> str:
-    backoff = 1.0
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            payload = resp.model_dump()
-            msg = (payload.get("choices") or [{}])[0].get("message")
-            return _extract_message_text(msg)
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            msg = str(exc).lower()
-            retryable = any(k in msg for k in ["429", "500", "502", "503", "504", "timeout", "temporarily"])
-            if attempt < retries and retryable:
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
-                continue
-            break
-    raise RuntimeError(f"OpenRouter request failed: {last_exc}")
+    """Chat-completion call wrapped with the shared rate-limit-aware retry loop.
+
+    On HTTP 429 responses, honors a server-provided ``Retry-After`` header
+    when present; otherwise (and for any other transient error) falls back to
+    exponential backoff with jitter. ``max_retries`` is the number of retries
+    after the first attempt (default 3, i.e. up to 4 attempts total, matching
+    this function's previous behavior).
+    """
+
+    def _call() -> str:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        payload = resp.model_dump()
+        msg = (payload.get("choices") or [{}])[0].get("message")
+        return _extract_message_text(msg)
+
+    def _on_retry(attempt: int, exc: BaseException, wait: float) -> None:
+        print(
+            f"  chat completion attempt {attempt + 1}/{max_retries + 1} failed: {exc} "
+            f"(retrying in {wait:.1f}s)"
+        )
+
+    try:
+        return retry_call(_call, max_retries=max_retries, backoff_base=backoff_base, on_retry=_on_retry)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
 
 
 def _generate_riddles(
@@ -248,6 +234,7 @@ def _generate_riddles(
     n_options: int,
     temperature: float,
     max_tokens: int,
+    max_retries: int = 3,
 ) -> Dict[str, Any]:
     user_prompt = _fill_x(template, concept, n_options=int(n_options))
     system_prompt = safe_prompt.strip() or "You are a helpful assistant."
@@ -257,6 +244,7 @@ def _generate_riddles(
         messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
         temperature=temperature,
         max_tokens=max_tokens,
+        max_retries=max_retries,
     )
     parsed = _parse_json_obj(content)
     riddles_any = parsed.get("riddles") if isinstance(parsed, dict) else []
@@ -288,22 +276,29 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Output root (default: results_textriddle_v4/attacks/analogy).",
     )
-    p.add_argument("--openrouter-api-key", type=str, default=None)
+    p.add_argument("--api-key", type=str, default=None)
     p.add_argument(
         "--api-base",
         type=str,
         default="",
         help=(
             "Optional API base URL (e.g., OLLAMA/REVE). "
-            "Falls back to env OLLAMA_API_BASE/REVE_API_BASE/OPENROUTER_API_BASE."
+            "Falls back to env LLM_API_BASE_URL/OLLAMA_API_BASE/REVE_API_BASE/OPENROUTER_API_BASE."
         ),
     )
-    p.add_argument("--gen-model", type=str, default="x-ai/grok-4.1-fast")
+    p.add_argument("--gen-model", type=str, default="gpt-5-2-azure-comm-il2")
     p.add_argument("--gen-template", type=str, default="")
     p.add_argument("--options", type=int, default=3)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--max-tokens", type=int, default=1800)
     p.add_argument("--skip-existing", action="store_true")
+    p.add_argument("--retries", type=int, default=3, help="Retries per (row, concept) after the first attempt.")
+    p.add_argument(
+        "--max-parallel",
+        type=int,
+        default=DEFAULT_MAX_PARALLEL,
+        help=f"Number of concurrent worker threads (default: {DEFAULT_MAX_PARALLEL}). Use 1 for sequential.",
+    )
     return p.parse_args()
 
 
@@ -318,12 +313,26 @@ def main() -> None:
     ).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
+    api_key = args.api_key or resolve_api_key()
+    if not api_key:
+        raise SystemExit("Please set LLM_API_KEY (or legacy OPENROUTER_API_KEY) before running.")
+
     rows = _load_csv_rows(csv_path)
     if not rows:
         raise SystemExit("CSV has no data rows.")
 
     template = _normalize_template(args.gen_template)
-    client = _get_openrouter_client(args.openrouter_api_key, args.api_base or None)
+    client = _get_openrouter_client(api_key, args.api_base or None)
+
+    # Phase 1 (sequential, no API calls): validate rows, create per-row output
+    # dirs, write row-level metadata, and flatten every (row, concept_type)
+    # pair that actually needs a riddle-generation call into a flat work list.
+    # This keeps the row-level file writes race-free (each happens exactly
+    # once, before any thread touches that row) while letting phase 2 fan the
+    # actual API calls out across threads.
+    work_items: List[Dict[str, Any]] = []
+    row_done_counts: Dict[int, int] = {}
+    row_total_counts: Dict[int, int] = {}
 
     for idx, row in enumerate(rows, start=1):
         safe_prompt = _pick_field(row, ["safe_prompt", "sentence", "prompt", "neutralized"])
@@ -356,6 +365,7 @@ def main() -> None:
         (row_dir / "row_meta.json").write_text(json.dumps(row_meta, indent=2, ensure_ascii=False), encoding="utf-8")
         (row_dir / "safe_prompt.txt").write_text((safe_prompt or "") + "\n", encoding="utf-8")
 
+        row_total_counts[idx] = 0
         for concept_type, concept in [
             ("x1", concept_x1),
             ("x2", concept_x2),
@@ -367,38 +377,73 @@ def main() -> None:
             concept_dir = row_dir / concept_type
             concept_dir.mkdir(parents=True, exist_ok=True)
             options_path = concept_dir / "text_riddle_options.json"
+            row_total_counts[idx] += 1
             if args.skip_existing and options_path.exists():
+                row_done_counts[idx] = row_done_counts.get(idx, 0) + 1
                 continue
-
-            payload = _generate_riddles(
-                client=client,
-                model=args.gen_model,
-                safe_prompt=safe_prompt,
-                template=template,
-                concept=concept,
-                n_options=int(args.options),
-                temperature=float(args.temperature),
-                max_tokens=int(args.max_tokens),
+            work_items.append(
+                {
+                    "row_index": idx,
+                    "category": category,
+                    "safe_prompt": safe_prompt,
+                    "concept_type": concept_type,
+                    "concept": concept,
+                    "concept_dir": concept_dir,
+                    "options_path": options_path,
+                }
             )
-            (concept_dir / "text_riddle_gen_input.txt").write_text(payload["user_prompt"] + "\n", encoding="utf-8")
-            (concept_dir / "safe_prompt.txt").write_text((safe_prompt or "") + "\n", encoding="utf-8")
 
-            out = {
-                "row_index": idx,
-                "category": category,
-                "concept_type": concept_type,
-                "concept": concept,
-                "gen_model": args.gen_model,
-                "n_options": len(payload["riddles"]),
-                "riddles": payload["riddles"],
-                "prompt_template": template,
-                "safe_prompt": safe_prompt,
-                "timestamp_utc": _utc_ts(),
-                "raw": payload["raw"],
-            }
-            options_path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+        if row_done_counts.get(idx, 0) >= row_total_counts.get(idx, 0):
+            print(f"[text_riddle_v4] row {idx}: done (already complete, skipped)")
 
-        print(f"[text_riddle_v4] row {idx}: done")
+    print_lock = threading.Lock()
+
+    def process_one(item: Dict[str, Any]) -> None:
+        idx = item["row_index"]
+        concept_type = item["concept_type"]
+        payload = _generate_riddles(
+            client=client,
+            model=args.gen_model,
+            safe_prompt=item["safe_prompt"],
+            template=template,
+            concept=item["concept"],
+            n_options=int(args.options),
+            temperature=float(args.temperature),
+            max_tokens=int(args.max_tokens),
+            max_retries=int(args.retries),
+        )
+        concept_dir = item["concept_dir"]
+        (concept_dir / "text_riddle_gen_input.txt").write_text(payload["user_prompt"] + "\n", encoding="utf-8")
+        (concept_dir / "safe_prompt.txt").write_text((item["safe_prompt"] or "") + "\n", encoding="utf-8")
+
+        out = {
+            "row_index": idx,
+            "category": item["category"],
+            "concept_type": concept_type,
+            "concept": item["concept"],
+            "gen_model": args.gen_model,
+            "n_options": len(payload["riddles"]),
+            "riddles": payload["riddles"],
+            "prompt_template": template,
+            "safe_prompt": item["safe_prompt"],
+            "timestamp_utc": _utc_ts(),
+            "raw": payload["raw"],
+        }
+        item["options_path"].write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        with print_lock:
+            row_done_counts[idx] = row_done_counts.get(idx, 0) + 1
+            if row_done_counts[idx] >= row_total_counts.get(idx, 0):
+                print(f"[text_riddle_v4] row {idx}: done")
+
+    max_parallel = max(1, int(args.max_parallel))
+    if not work_items:
+        print("[text_riddle_v4] nothing to do (all rows already have riddles, or --skip-existing found none missing).")
+    elif max_parallel <= 1:
+        for item in work_items:
+            process_one(item)
+    else:
+        run_concurrent(work_items, process_one, max_parallel=max_parallel, thread_name_prefix="TextRiddleWorker")
 
 
 if __name__ == "__main__":

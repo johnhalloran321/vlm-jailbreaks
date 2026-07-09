@@ -10,11 +10,12 @@ from typing import Dict, List, Optional
 
 from openai import OpenAI
 
+from attacks.common.llm_client import resolve_api_key, resolve_base_url, is_openrouter_base_url, get_client
 from attacks.textual_replacement.attack_prompts import SLOT_ORDER
 
 DEFAULT_MODELS = {
     "ollama": "qwen3-vl:235b-instruct",
-    "openrouter": "qwen/qwen3-vl-32b-instruct",
+    "openrouter": "gpt-5-2-azure-comm-il2",
 }
 
 
@@ -166,19 +167,23 @@ def run_attack_for_texts(
         )
         content = response.get("message", {}).get("content", "")
     elif provider == "openrouter":
-        resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        resolved_key = resolve_api_key(api_key)
         if not resolved_key:
-            raise ValueError("OPENROUTER_API_KEY not provided")
-        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=resolved_key)
+            raise ValueError(
+                "No API key found. Set LLM_API_KEY (preferred) or OPENROUTER_API_KEY, "
+                "or pass api_key explicitly."
+            )
+        client = get_client(api_key=resolved_key)
         content_parts = [{"type": "text", "text": prompt}]
         for text in labeled_texts:
             content_parts.append({"type": "text", "text": text})
+        extra_body = {"include_reasoning": False} if is_openrouter_base_url() else None
         resp = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": content_parts}],
             max_tokens=2000,
             temperature=0.0,
-            extra_body={"include_reasoning": False},
+            extra_body=extra_body,
         )
         content = resp.choices[0].message.content or ""
     else:

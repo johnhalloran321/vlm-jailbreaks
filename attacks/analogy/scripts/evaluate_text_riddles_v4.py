@@ -45,15 +45,15 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from attacks.common.llm_client import get_client, resolve_api_key
+
 MAX_PARALLEL_DEFAULT = 4
 MAX_PARALLEL_CAP = 8
 
 DEFAULT_GUESS_MODELS = [
-    "openai/gpt-5.2",
-    "google/gemini-3-flash-preview",
-    "qwen/qwen3-vl-32b-instruct",
-    "x-ai/grok-4.1-fast",
-    "anthropic/claude-haiku-4.5",
+    "gpt-5-2-azure-comm-il2",
+    "claude-4-5-sonnet-aws-comm-il2",
+    "claude-4-5-haiku-aws-comm-il2",
 ]
 
 DEFAULT_GUESS_PROMPT = (
@@ -76,22 +76,7 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _get_openrouter_client(api_key: Optional[str], base_url: Optional[str]):
-    from openai import OpenAI
-
-    resolved_base = (
-        base_url
-        or os.environ.get("OLLAMA_API_BASE")
-        or os.environ.get("OPENROUTER_API_BASE")
-        or "https://openrouter.ai/api/v1"
-    )
-    key = (
-        api_key
-        or os.environ.get("OLLAMA_API_KEY")
-        or os.environ.get("OPENROUTER_API_KEY")
-    )
-    if not key:
-        raise ValueError("API key not provided. Export OPENROUTER_API_KEY or pass --openrouter-api-key.")
-    return OpenAI(base_url=resolved_base, api_key=key)
+    return get_client(api_key=api_key, base_url=base_url)
 
 
 def _extract_message_text(msg: Any) -> str:
@@ -439,7 +424,7 @@ def parse_args() -> argparse.Namespace:
         "--results-root", type=str, required=True,
         help="Root of text riddle outputs (from text_riddle_run_v4.py).",
     )
-    p.add_argument("--openrouter-api-key", type=str, default=None)
+    p.add_argument("--api-key", type=str, default=None)
     p.add_argument("--api-base", type=str, default="")
     p.add_argument(
         "--guess-models", type=str, default=",".join(DEFAULT_GUESS_MODELS),
@@ -468,6 +453,10 @@ def main() -> None:
     results_root = Path(args.results_root).resolve()
     if not results_root.exists():
         raise SystemExit(f"Results root not found: {results_root}")
+
+    api_key = args.api_key or resolve_api_key()
+    if not api_key:
+        raise SystemExit("Please set LLM_API_KEY (or legacy OPENROUTER_API_KEY) before running.")
 
     guess_models = [m.strip() for m in args.guess_models.split(",") if m.strip()]
     if not guess_models:
@@ -499,7 +488,7 @@ def main() -> None:
                 match_judge_model=args.match_judge_model,
                 match_judge_max_tokens=args.match_judge_max_tokens,
                 skip_existing=args.skip_existing,
-                openrouter_api_key=args.openrouter_api_key,
+                openrouter_api_key=api_key,
                 api_base=args.api_base or None,
                 quiet=args.quiet,
             )

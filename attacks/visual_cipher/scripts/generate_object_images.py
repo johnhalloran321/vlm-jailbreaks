@@ -13,8 +13,13 @@ import time
 import urllib.request
 import sys
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Optional
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 PROMPTS: List[str] = [
@@ -157,46 +162,6 @@ def decode_image_url(url: str) -> bytes:
         return resp.read()
 
 
-def extract_images(payload: dict) -> List[bytes]:
-    images: List[bytes] = []
-    for choice in payload.get("choices", []):
-        msg = choice.get("message", {}) or {}
-        msg_images = msg.get("images")
-        if isinstance(msg_images, list):
-            for item in msg_images:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "image_url":
-                    url = (item.get("image_url") or {}).get("url") or item.get("url")
-                    if url:
-                        images.append(decode_image_url(url))
-                else:
-                    data = item.get("data") or item.get("b64_json")
-                    if data:
-                        images.append(base64.b64decode(data))
-        content = msg.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") == "image_url":
-                    url = (part.get("image_url") or {}).get("url") or part.get("url")
-                    if url:
-                        images.append(decode_image_url(url))
-                elif part.get("type") in ("image", "output_image"):
-                    data = part.get("image") or part.get("data") or part.get("b64_json")
-                    if data:
-                        images.append(base64.b64decode(data))
-        elif isinstance(content, str):
-            match = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=]+)", content)
-            if match:
-                images.append(base64.b64decode(match.group(1)))
-        for key in ("image", "data", "b64_json"):
-            if isinstance(msg.get(key), str):
-                images.append(base64.b64decode(msg[key]))
-    return images
-
-
 def ensure_deps() -> None:
     try:
         import openai  # noqa: F401
@@ -216,13 +181,31 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between requests.")
+    parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between requests (sequential mode only, i.e. --max-parallel 1).")
     parser.add_argument("--timeout", type=float, default=180.0, help="Request timeout in seconds.")
     parser.add_argument("--retries", type=int, default=3, help="Retries per prompt on failure.")
-    parser.add_argument("--response-format", type=str, default="image", help="Response format type.")
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=None,
+        help="Number of concurrent worker threads (default: DEFAULT_MAX_PARALLEL, currently 8). Use 1 for sequential.",
+    )
+    parser.add_argument("--response-format", type=str, default="image", help="Response format type (chat API style only).")
+    parser.add_argument(
+        "--image-api",
+        type=str,
+        default="auto",
+        choices=["auto", "chat", "responses"],
+        help=(
+            "API shape to use for image generation. 'chat' = legacy chat.completions + "
+            "response_format={'type':'image'} (OpenRouter-style image models, e.g. Gemini image). "
+            "'responses' = Responses API + image_generation tool (required for OpenAI GPT-5.x image "
+            "generation). 'auto' (default) guesses from --model (gpt-5* -> responses, else chat)."
+        ),
+    )
     parser.add_argument("--image-config", type=str, default="", help="Optional JSON dict for image_config.")
     parser.add_argument("--prompts-file", type=Path, default=None, help="Optional text file with one object per line.")
-    parser.add_argument("--api-key", type=str, default="", help="OpenRouter API key (or set OPENROUTER_API_KEY).")
+    parser.add_argument("--api-key", type=str, default="", help="API key for the gateway (or set LLM_API_KEY / legacy OPENROUTER_API_KEY).")
     parser.add_argument("--app-name", type=str, default="", help="Optional OpenRouter app name.")
     parser.add_argument("--app-url", type=str, default="", help="Optional OpenRouter app URL.")
     parser.add_argument("--overwrite", action="store_true", help="Regenerate images even if files already exist.")
@@ -230,28 +213,40 @@ def main() -> None:
 
     ensure_deps()
 
-    from openai import OpenAI
     from PIL import Image
+    from attacks.common.llm_client import get_client
+    from attacks.common.image_gen import DEFAULT_MAX_PARALLEL, request_image_with_retry
+
+    max_parallel = max(1, args.max_parallel if args.max_parallel is not None else DEFAULT_MAX_PARALLEL)
 
     prompts = load_prompts(args.prompts_file)
     if args.count > len(prompts):
         raise SystemExit(f"Requested {args.count} images, but only {len(prompts)} prompts available.")
-
-    api_key = args.api_key or os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise SystemExit("Missing OPENROUTER_API_KEY (or pass --api-key).")
 
     headers = {}
     if args.app_name:
         headers["X-Title"] = args.app_name
     if args.app_url:
         headers["HTTP-Referer"] = args.app_url
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-        default_headers=headers or None,
-        timeout=args.timeout,
-    )
+    # NOTE: this needs an actual image-generation-capable model. OpenRouter-style
+    # image models (e.g. Gemini image) are called via the legacy chat.completions
+    # endpoint (--image-api chat); OpenAI GPT-5.x models generate images only via
+    # the Responses API's image_generation tool (--image-api responses, or leave
+    # --image-api auto and it's picked from the model name). A plain text/reasoning
+    # chat deployment with neither of these capabilities will not work.
+    #
+    # get_client() also honors LLM_API_INSECURE_SSL=1 to skip TLS verification
+    # for internal gateways with self-signed/internal-CA certs (see
+    # attacks/common/llm_client.py) -- without it, a cert-trust failure shows up
+    # here as an opaque "Connection error" that looks like a bad URL/network issue.
+    try:
+        client = get_client(
+            api_key=args.api_key or None,
+            timeout=args.timeout,
+            default_headers=headers or None,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
     if args.image_config:
         image_config = json.loads(args.image_config)
@@ -270,54 +265,61 @@ def main() -> None:
         "images": [],
     }
 
-    for idx, obj in enumerate(prompts[: args.count]):
+    work_items = list(enumerate(prompts[: args.count]))
+
+    def process_one(item: tuple) -> Optional[Dict[str, Any]]:
+        idx, obj = item
         prompt = build_prompt(obj)
         filename = f"{idx:03d}_{slugify(obj)}.png"
         out_path = args.output_dir / filename
+        entry = {"index": idx, "object": obj, "prompt": prompt, "file": filename, "seed": args.seed + idx}
         if out_path.exists() and not args.overwrite:
-            manifest["images"].append(
-                {"index": idx, "object": obj, "prompt": prompt, "file": filename, "seed": args.seed + idx}
-            )
-            continue
+            return entry
 
         print(f"[{idx+1}/{args.count}] Requesting image for: {obj}")
-        last_err = None
-        images = []
-        for attempt in range(args.retries + 1):
-            try:
-                response = client.chat.completions.create(
-                    model=args.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=args.max_tokens,
-                    temperature=args.temperature,
-                    seed=args.seed + idx,
-                    response_format={"type": args.response_format} if args.response_format else None,
-                    extra_body={"image_config": image_config} if image_config else None,
-                )
-                payload = response.model_dump()
-                images = extract_images(payload)
-                if images:
-                    break
-                last_err = RuntimeError("No image returned in response.")
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
-            wait_s = min(10.0, 1.0 + attempt * 2)
-            print(f"  retry {attempt + 1}/{args.retries} after error: {last_err}")
-            time.sleep(wait_s)
-        if not images:
-            print(f"Warning: failed to get image for {obj}: {last_err}")
-            continue
+
+        def _on_retry(attempt: int, exc: BaseException, wait: float) -> None:
+            print(f"  attempt {attempt + 1}/{args.retries + 1} failed: {exc} (retrying in {wait:.1f}s)")
+
+        try:
+            images = request_image_with_retry(
+                client,
+                model=args.model,
+                prompt=prompt,
+                api_style=args.image_api,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                seed=args.seed + idx,
+                response_format=args.response_format,
+                image_config=image_config,
+                max_retries=args.retries,
+                on_retry=_on_retry,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: failed to get image for {obj}: {exc}")
+            return None
 
         image = Image.open(io.BytesIO(images[0])).convert("RGB")
         if args.output_size and image.size != (args.output_size, args.output_size):
             image = image.resize((args.output_size, args.output_size), Image.LANCZOS)
         image.save(out_path)
-        manifest["images"].append(
-            {"index": idx, "object": obj, "prompt": prompt, "file": filename, "seed": args.seed + idx}
-        )
         print(f"Wrote {out_path}")
-        if args.sleep > 0:
+        if max_parallel <= 1 and args.sleep > 0:
             time.sleep(args.sleep)
+        return entry
+
+    results: List[Optional[Dict[str, Any]]] = [None] * len(work_items)
+    if max_parallel <= 1:
+        for i, item in enumerate(work_items):
+            results[i] = process_one(item)
+    else:
+        with ThreadPoolExecutor(max_workers=max_parallel, thread_name_prefix="ObjectImageWorker") as pool:
+            future_to_index = {pool.submit(process_one, item): i for i, item in enumerate(work_items)}
+            for future in future_to_index:
+                i = future_to_index[future]
+                results[i] = future.result()
+
+    manifest["images"] = [entry for entry in results if entry is not None]
 
     (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"Manifest written to {args.output_dir / 'manifest.json'}")

@@ -4,15 +4,26 @@
 from __future__ import annotations
 
 import json
-import os
+import sys
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from openai import OpenAI
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
+from attacks.common.llm_client import get_client, is_openrouter_base_url
+
+# NOTE: The paper's judge panel (x-ai/grok-4.1-fast, google/gemini-3-flash-preview,
+# anthropic/claude-haiku-4.5) spans three vendors reachable only via OpenRouter. In
+# this environment only OpenAI (GPT-5.x) and Anthropic (Claude) models are reachable
+# via the configured LiteLLM gateway, so the default panel below is a 2-vendor
+# substitute, not the paper's exact ensemble -- results using these defaults should
+# be labeled as a partial/adapted reproduction, not an exact match to the paper.
 DEFAULT_JUDGE_MODELS = [
-    "x-ai/grok-4.1-fast",
-    "google/gemini-3-flash-preview",
-    "anthropic/claude-haiku-4.5",
+    "gpt-5-2-azure-comm-il2",
+    "claude-4-5-sonnet-aws-comm-il2",
+    "claude-4-5-haiku-aws-comm-il2",
 ]
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_THINKING = False
@@ -62,28 +73,8 @@ Return JSON only with this shape:
 Do not include any text besides the JSON."""
 
 
-def _get_openrouter_client(api_key: Optional[str], base_url: Optional[str]) -> OpenAI:
-    resolved_base = (
-        base_url
-        or os.environ.get("OLLAMA_API_BASE")
-        or os.environ.get("REVE_API_BASE")
-        or os.environ.get("OPENROUTER_API_BASE")
-        or "https://openrouter.ai/api/v1"
-    )
-    resolved_key = (
-        api_key
-        or os.environ.get("OLLAMA_API_KEY")
-        or os.environ.get("REVE_API_KEY")
-        or os.environ.get("OPENROUTER_API_KEY")
-    )
-    if not resolved_key:
-        if str(resolved_base).startswith("http://localhost:11434") or str(resolved_base).startswith(
-            "http://127.0.0.1:11434"
-        ):
-            resolved_key = "ollama"
-        else:
-            raise ValueError("API key not provided. Export OLLAMA/REVE/OPENROUTER key or pass api_key.")
-    return OpenAI(base_url=resolved_base, api_key=resolved_key)
+def _get_openrouter_client(api_key: Optional[str], base_url: Optional[str]):
+    return get_client(api_key=api_key, base_url=base_url)
 
 
 def _normalize_message_content(content: Any) -> Optional[str]:
@@ -157,7 +148,11 @@ def judge_responses(
     models = _normalize_judge_models(judge_models)
     prompt = build_judge_prompt(behavior, replies)
     results: List[Dict[str, Any]] = []
-    extra = {"include_reasoning": True} if thinking else None
+    # `include_reasoning` is an OpenRouter-only extra_body field; sending it to other
+    # OpenAI-compatible gateways (e.g. LiteLLM fronting Azure OpenAI / Bedrock) can
+    # raise an "unrecognized field" error, so only send it when actually talking to
+    # OpenRouter.
+    extra = {"include_reasoning": True} if (thinking and is_openrouter_base_url(api_base)) else None
     for model in models:
         resp = client.chat.completions.create(
             model=model,

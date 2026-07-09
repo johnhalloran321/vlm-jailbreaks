@@ -29,7 +29,6 @@ import json
 import os
 import re
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,9 +36,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from attacks.common.llm_client import get_client, resolve_api_key
+from attacks.common.image_gen import DEFAULT_MAX_PARALLEL, request_image_with_retry
 
 
 def _utc_ts() -> str:
@@ -55,32 +57,7 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def _get_openrouter_client(api_key: Optional[str], base_url: Optional[str]):
-    from openai import OpenAI  # local import
-
-    resolved_base = (
-        base_url
-        or os.environ.get("OLLAMA_API_BASE")
-        or os.environ.get("REVE_API_BASE")
-        or os.environ.get("OPENROUTER_API_BASE")
-        or "https://openrouter.ai/api/v1"
-    )
-    resolved = (
-        api_key
-        or os.environ.get("OLLAMA_API_KEY")
-        or os.environ.get("REVE_API_KEY")
-        or os.environ.get("OPENROUTER_API_KEY")
-    )
-    if not resolved:
-        if str(resolved_base).startswith("http://localhost:11434") or str(resolved_base).startswith(
-            "http://127.0.0.1:11434"
-        ):
-            resolved = "ollama"
-        else:
-            raise ValueError(
-                "API key not provided. Export OLLAMA_API_KEY/REVE_API_KEY/OPENROUTER_API_KEY "
-                "or pass --openrouter-api-key."
-            )
-    return OpenAI(base_url=resolved_base, api_key=resolved)
+    return get_client(api_key=api_key, base_url=base_url)
 
 
 def _extract_message_text(msg: Any) -> str:
@@ -145,43 +122,6 @@ def _decode_image_url(url: str) -> bytes:
         return resp.read()
 
 
-def _extract_images_from_payload(payload: dict) -> List[bytes]:
-    images: List[bytes] = []
-    for choice in payload.get("choices", []):
-        msg = choice.get("message", {}) or {}
-        content = msg.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") == "image_url":
-                    url = (part.get("image_url") or {}).get("url") or part.get("url")
-                    if url:
-                        images.append(_decode_image_url(url))
-                elif part.get("type") in ("image", "output_image"):
-                    data = part.get("image") or part.get("data") or part.get("b64_json")
-                    if data:
-                        images.append(base64.b64decode(data))
-        elif isinstance(content, str):
-            match = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=]+)", content)
-            if match:
-                images.append(base64.b64decode(match.group(1)))
-        msg_images = msg.get("images")
-        if isinstance(msg_images, list):
-            for item in msg_images:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "image_url":
-                    url = (item.get("image_url") or {}).get("url") or item.get("url")
-                    if url:
-                        images.append(_decode_image_url(url))
-                else:
-                    data = item.get("data") or item.get("b64_json")
-                    if data:
-                        images.append(base64.b64decode(data))
-    return images
-
-
 def _category_allowed(category: str, allowlist: Sequence[str]) -> bool:
     def norm(x: str) -> str:
         s = (x or "").strip().lower()
@@ -212,7 +152,10 @@ def generate_image_prompt_options(
     temperature: float,
     max_tokens: int,
     include_reasoning: bool,
+    base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
+    from attacks.common.llm_client import is_openrouter_base_url
+
     system = (
         "You convert a text analogy riddle description into prompts for an image generation model.\n"
         "Return JSON only: {\"prompts\": [\"...\", ...]}.\n"
@@ -225,13 +168,15 @@ def generate_image_prompt_options(
         "- Be a single line (no newlines)\n"
     )
     user = f'Text riddle:\n"""{text_riddle}"""'
+    # `include_reasoning` is an OpenRouter-only extra_body field; only send when talking to OpenRouter
+    extra_body = {"include_reasoning": include_reasoning} if is_openrouter_base_url(base_url) else None
     resp = client.chat.completions.create(
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=temperature,
         max_tokens=max_tokens,
         response_format={"type": "json_object"},
-        extra_body={"include_reasoning": True} if include_reasoning else {"include_reasoning": False},
+        extra_body=extra_body if extra_body else None,
     )
     payload = resp.model_dump()
     msg = (payload.get("choices") or [{}])[0].get("message")
@@ -264,6 +209,7 @@ def generate_images_for_prompt(
     max_tokens: int,
     retries: int,
     out_dir: Path,
+    image_api: str = "auto",
 ) -> List[Dict[str, Any]]:
     out_dir.mkdir(parents=True, exist_ok=True)
     records: List[Dict[str, Any]] = []
@@ -272,25 +218,23 @@ def generate_images_for_prompt(
         out_path = out_dir / f"riddle_{i:03d}.png"
         last_err: Optional[Exception] = None
         images: List[bytes] = []
-        for attempt in range(retries + 1):
-            try:
-                resp = client.chat.completions.create(
-                    model=image_model,
-                    messages=[{"role": "user", "content": image_prompt}],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    seed=seed,
-                    response_format={"type": "image"},
-                    extra_body={"image_config": image_config} if image_config else None,
-                )
-                payload = resp.model_dump()
-                images = _extract_images_from_payload(payload)
-                if images:
-                    break
+        try:
+            images = request_image_with_retry(
+                client,
+                model=image_model,
+                prompt=image_prompt,
+                api_style=image_api,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                seed=seed,
+                response_format="image",
+                image_config=image_config,
+                max_retries=retries,
+            )
+            if not images:
                 last_err = RuntimeError("No image returned in response.")
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
-            time.sleep(min(10.0, 1.0 + attempt * 2))
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
         if not images:
             records.append({"index": i, "seed": seed, "error": str(last_err)})
             continue
@@ -344,14 +288,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate images from text riddle options (v4).")
     p.add_argument("--text-results-root", type=str, required=True)
     p.add_argument("--results-root", type=str, default="")
-    p.add_argument("--openrouter-api-key", type=str, default=None)
+    p.add_argument("--api-key", type=str, default=None)
     p.add_argument(
         "--api-base",
         type=str,
         default="",
         help=(
             "Optional API base URL (e.g., OLLAMA/REVE). "
-            "Falls back to env OLLAMA_API_BASE/REVE_API_BASE/OPENROUTER_API_BASE."
+            "Falls back to env LLM_API_BASE_URL/OLLAMA_API_BASE/REVE_API_BASE/OPENROUTER_API_BASE."
         ),
     )
     p.add_argument("--allow-categories", nargs="*", default=[])
@@ -361,16 +305,33 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Limit to X1..X4 (values: x1 x2 x3 x4).",
     )
-    p.add_argument("--prompt-gen-model", type=str, default="x-ai/grok-4.1-fast")
+    p.add_argument("--prompt-gen-model", type=str, default="gpt-5-2-azure-comm-il2")
     p.add_argument("--prompt-include-reasoning", action="store_true")
     p.add_argument("--image-model", type=str, default="google/gemini-2.5-flash-image")
+    p.add_argument(
+        "--image-api",
+        type=str,
+        default="auto",
+        choices=["auto", "chat", "responses"],
+        help=(
+            "API shape to use for --image-model. 'chat' = legacy chat.completions + "
+            "response_format={'type':'image'} (OpenRouter-style image models, e.g. Gemini image). "
+            "'responses' = Responses API + image_generation tool (required for OpenAI GPT-5.x image "
+            "generation). 'auto' (default) guesses from --image-model (gpt-5* -> responses, else chat)."
+        ),
+    )
     p.add_argument("--prompt-options", type=int, default=3)
     p.add_argument("--pick-option", type=int, default=0)
     p.add_argument("--images-per-option", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--skip-existing", action="store_true")
-    p.add_argument("--max-parallel", type=int, default=1)
+    p.add_argument(
+        "--max-parallel",
+        type=int,
+        default=DEFAULT_MAX_PARALLEL,
+        help=f"Number of concurrent worker threads (default {DEFAULT_MAX_PARALLEL}). Use 1 for sequential.",
+    )
     return p.parse_args()
 
 
@@ -384,6 +345,7 @@ def _process_item(
     out_root: Path,
     allow: Sequence[str],
     only_types: Sequence[str],
+    api_base: Optional[str] = None,
 ) -> None:
     category = item["category"]
     if not _category_allowed(category, allow):
@@ -414,6 +376,7 @@ def _process_item(
         temperature=0.7,
         max_tokens=1200,
         include_reasoning=bool(args.prompt_include_reasoning),
+        base_url=api_base,
     )
     _write_json(out_dir / "image_prompt_options.json", prompt_payload)
     prompts = prompt_payload.get("prompts") or []
@@ -448,6 +411,7 @@ def _process_item(
         max_tokens=64,
         retries=int(args.retries),
         out_dir=images_dir,
+        image_api=args.image_api,
     )
 
     _write_json(
@@ -481,7 +445,11 @@ def main() -> None:
     ).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    client = _get_openrouter_client(args.openrouter_api_key, args.api_base or None)
+    api_key = args.api_key or resolve_api_key()
+    if not api_key:
+        raise SystemExit("Please set LLM_API_KEY (or legacy OPENROUTER_API_KEY) before running.")
+
+    client = _get_openrouter_client(api_key, args.api_base or None)
     image_config = {"size": "1024x1024"}
 
     allow = args.allow_categories or []
@@ -505,6 +473,7 @@ def main() -> None:
                 out_root=out_root,
                 allow=allow,
                 only_types=only_types,
+                api_base=args.api_base or None,
             )
     else:
         with ThreadPoolExecutor(max_workers=max_parallel) as ex:
@@ -521,6 +490,7 @@ def main() -> None:
                         out_root=out_root,
                         allow=allow,
                         only_types=only_types,
+                        api_base=args.api_base or None,
                     )
                 )
             for f in futures:

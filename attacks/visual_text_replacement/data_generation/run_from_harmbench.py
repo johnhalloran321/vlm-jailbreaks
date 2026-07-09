@@ -6,7 +6,9 @@ This script reads harmbench_neutralized.csv and:
 1. Extracts all unique objects from X1, X2, X3, X4 columns
 2. Searches for real-world references (books, movies, etc.) containing each object
 3. Downloads reference images
-4. Generates missing images using REVE Create API
+4. Generates missing images via an OpenAI-compatible image-gen endpoint
+   (e.g. GPT-5.2 -- this originally used REVE's Create API, which this repo
+   doesn't have access to; see attacks/common/image_gen.py)
 5. Creates attack images replacing the object text with X1, X2, X3, or X4
 
 Output structure:
@@ -35,6 +37,13 @@ import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from attacks.common.llm_client import get_client  # noqa: E402
+from attacks.common.image_gen import DEFAULT_MAX_PARALLEL  # noqa: E402
 
 # Import local modules
 from .search_references import process_config as search_references
@@ -153,30 +162,36 @@ def run_generate_step(
     manifest_path: Path,
     output_dir: Path,
     objects: List[str],
-    api_key: str,
+    client,
+    model: str,
+    image_api: str = "auto",
     num_images: int = 3,
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
 ) -> Path:
-    """Step 2b: Generate missing images using REVE Create API."""
+    """Step 2b: Generate missing images via an OpenAI-compatible image-gen endpoint."""
     print("\n" + "="*60)
     print("STEP 2b: Generating Missing Images")
     print("="*60)
-    
+
     base_dir = output_dir / "base"
-    
+
     # Load existing manifest
     if manifest_path.exists():
         with open(manifest_path) as f:
             manifest = json.load(f)
     else:
         manifest = {}
-    
+
     # Generate missing images
     updated_manifest = generate_missing_images(
         manifest=manifest,
         objects=objects,
         base_dir=base_dir,
-        api_key=api_key,
+        client=client,
+        model=model,
+        api_style=image_api,
         num_images=num_images,
+        max_parallel=max_parallel,
     )
     
     # Save updated manifest
@@ -196,7 +211,10 @@ def run_attack_step(
     manifest_path: Path,
     output_dir: Path,
     objects_to_xn: Dict[str, Set[str]],
-    api_key: str,
+    client,
+    model: str,
+    image_api: str = "auto",
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
 ) -> Dict[str, Dict[str, List[str]]]:
     """
     Step 3: Apply text replacement attack to images.
@@ -240,8 +258,11 @@ def run_attack_step(
                 base_dir=base_dir,
                 output_dir=attack_dir,
                 replacement=xn,
-                api_key=api_key,
+                client=client,
+                model=model,
+                api_style=image_api,
                 redo_existing=False,
+                max_parallel=max_parallel,
             )
             
             if xn not in all_results:
@@ -262,47 +283,53 @@ def run_attack_step(
 def run_full_pipeline(
     csv_path: Path,
     output_dir: Path,
+    model: Optional[str] = None,
+    image_api: str = "auto",
     api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
     num_images: int = 3,
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
 ):
     """Run the complete pipeline from harmbench CSV."""
-    
+
     # Load CSV and extract objects
     rows = load_harmbench_csv(csv_path)
     objects_to_xn = extract_objects_with_xn(rows)
     objects = list(objects_to_xn.keys())
-    
+
     print(f"Loaded {len(rows)} behaviors from {csv_path}")
     print(f"Extracted {len(objects)} unique objects")
     print(f"Output directory: {output_dir}")
-    
+
     # Show object -> Xn mapping summary
     print("\nObject -> Xn mapping:")
     for obj, xns in sorted(objects_to_xn.items()):
         print(f"  {obj}: {', '.join(sorted(xns))}")
-    
-    # Get API key
-    if api_key is None:
-        api_key = os.environ.get("REVE_API_KEY")
-    
-    if not api_key:
-        print("Error: REVE_API_KEY not set")
-        sys.exit(1)
-    
+
+    # Build the LLM gateway client (see attacks/common/llm_client.py for the
+    # full api_key/base_url resolution order -- this no longer requires REVE).
+    client = get_client(api_key=api_key, base_url=base_url)
+    if model is None:
+        model = os.environ.get("IMAGE_GEN_MODEL", "openai/gpt-5.2")
+
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Step 1: Search
     references_path = run_search_step(objects, output_dir)
-    
+
     # Step 2: Download
     manifest_path = run_download_step(references_path, output_dir, num_images)
-    
+
     # Step 2b: Generate missing
-    manifest_path = run_generate_step(manifest_path, output_dir, objects, api_key, num_images)
-    
+    manifest_path = run_generate_step(
+        manifest_path, output_dir, objects, client, model, image_api, num_images, max_parallel
+    )
+
     # Step 3: Attack with Xn replacements
-    results = run_attack_step(manifest_path, output_dir, objects_to_xn, api_key)
+    results = run_attack_step(
+        manifest_path, output_dir, objects_to_xn, client, model, image_api, max_parallel
+    )
     
     # Final summary
     print("\n" + "="*60)
@@ -347,12 +374,37 @@ def parse_args() -> argparse.Namespace:
         help="Number of images per object (default: 3)"
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        default=os.environ.get("IMAGE_GEN_MODEL", "openai/gpt-5.2"),
+        help="Image-gen model name (default: $IMAGE_GEN_MODEL or openai/gpt-5.2).",
+    )
+    parser.add_argument(
+        "--image-api",
+        type=str,
+        default="auto",
+        choices=["auto", "chat", "responses"],
+        help="API shape to use for image generation/editing (see attacks/common/image_gen.py).",
+    )
+    parser.add_argument(
         "--api-key",
         type=str,
-        default=os.environ.get("REVE_API_KEY"),
-        help="REVE API key"
+        default=None,
+        help="LLM gateway API key override (else LLM_API_KEY / etc., see attacks/common/llm_client.py).",
     )
-    
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="LLM gateway base URL override (else LLM_API_BASE_URL / etc.).",
+    )
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=DEFAULT_MAX_PARALLEL,
+        help=f"Number of concurrent worker threads (default {DEFAULT_MAX_PARALLEL}). Use 1 for sequential.",
+    )
+
     return parser.parse_args()
 
 
@@ -395,32 +447,36 @@ def main():
             print(f"Error: Manifest not found: {manifest_path}")
             print("Run the 'download' step first.")
             sys.exit(1)
-        
-        if not args.api_key:
-            print("Error: REVE_API_KEY not set")
-            sys.exit(1)
-        
-        run_generate_step(manifest_path, output_dir, objects, args.api_key, args.num_images)
-        
+
+        client = get_client(api_key=args.api_key, base_url=args.base_url)
+        run_generate_step(
+            manifest_path, output_dir, objects, client, args.model, args.image_api, args.num_images,
+            args.max_parallel,
+        )
+
     elif args.step == "attack":
         manifest_path = output_dir / "base" / "manifest.json"
         if not manifest_path.exists():
             print(f"Error: Manifest not found: {manifest_path}")
             print("Run the 'download' step first.")
             sys.exit(1)
-        
-        if not args.api_key:
-            print("Error: REVE_API_KEY not set")
-            sys.exit(1)
-        
-        run_attack_step(manifest_path, output_dir, objects_to_xn, args.api_key)
-        
+
+        client = get_client(api_key=args.api_key, base_url=args.base_url)
+        run_attack_step(
+            manifest_path, output_dir, objects_to_xn, client, args.model, args.image_api,
+            args.max_parallel,
+        )
+
     else:  # full pipeline
         run_full_pipeline(
             csv_path=csv_path,
             output_dir=output_dir,
+            model=args.model,
+            image_api=args.image_api,
             api_key=args.api_key,
+            base_url=args.base_url,
             num_images=args.num_images,
+            max_parallel=args.max_parallel,
         )
 
 

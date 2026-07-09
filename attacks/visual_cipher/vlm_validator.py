@@ -17,11 +17,18 @@ import csv
 import base64
 import json
 import os
+import sys
 import textwrap
 from pathlib import Path
 from typing import List, Tuple
 
-from openai import OpenAI
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from attacks.common.llm_client import get_client, is_openrouter_base_url, resolve_api_key
+
+DEFAULT_MODEL = "gpt-5-2-azure-comm-il2"
 
 
 def slugify(text: str, fallback: str, index: int, used: set[str]) -> str:
@@ -136,7 +143,7 @@ def build_prompt(vocab: List[str], descriptions: List[str], task: str) -> str:
 def request_decode(
     *, legend_path: Path, sentence_path: Path, prompt: str, model: str, temperature: float, api_key: str, task: str
 ) -> str:
-    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+    client = get_client(api_key=api_key)
     legend_b64 = encode_image(legend_path)
     sentence_b64 = encode_image(sentence_path)
 
@@ -160,12 +167,15 @@ def request_decode(
     ]
 
     # Explicitly disable reasoning/thinking modes by setting include_reasoning to False.
+    # This is an OpenRouter-only extra_body field, so only send it when actually
+    # talking to OpenRouter -- other OpenAI-compatible gateways may reject it.
+    extra_body = {"include_reasoning": False} if is_openrouter_base_url() else None
     response = client.chat.completions.create(
         model=model,
         messages=messages,
         max_tokens=2000,  # generous to avoid truncation
         temperature=temperature,
-        extra_body={"include_reasoning": False},
+        extra_body=extra_body,
     )
     try:
         return response.choices[0].message.content or ""
@@ -184,7 +194,7 @@ def main() -> None:
     parser.add_argument("--slug", type=str, default=None, help="Slug subfolder under batch-root to load files from")
     parser.add_argument("--all-slugs", action="store_true", help="If set, run on every subdirectory under batch-root")
     parser.add_argument("--csv", type=Path, default=Path("sample_behaviors.csv"), help="CSV to filter slugs; only FunctionalCategory=standard processed.")
-    parser.add_argument("--model", type=str, default="qwen/qwen3-vl-32b-instruct")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--save-output", action="store_true", help="Write the model reply (and parsed tokens) to disk")
     parser.add_argument(
@@ -211,9 +221,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    api_key = resolve_api_key()
     if not api_key:
-        raise SystemExit("Please set OPENROUTER_API_KEY before running.")
+        raise SystemExit("Please set LLM_API_KEY (or legacy OPENROUTER_API_KEY) before running.")
 
     def run_one(base_dir: Path) -> None:
         legend_path = base_dir / "legend.png"

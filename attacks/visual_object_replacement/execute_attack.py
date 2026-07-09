@@ -8,13 +8,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from attacks.common.llm_client import resolve_api_key
 from attacks.common.ollama_inference import analyze_multiple_images_ollama
 from attacks.common.openrouter_inference import analyze_multiple_images_openrouter
 from attacks.visual_object_replacement.attack_prompts import SLOT_ORDER
 
 DEFAULT_MODELS = {
     "ollama": "qwen3-vl:235b-instruct",
-    "openrouter": "qwen/qwen2.5-vl-32b-instruct",
+    "openrouter": "gpt-5-2-azure-comm-il2",
 }
 
 
@@ -154,9 +155,12 @@ def run_attack_for_images(
             verbose=not quiet,
         )
     elif provider == "openrouter":
-        resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        resolved_key = resolve_api_key(api_key)
         if not resolved_key:
-            raise ValueError("OPENROUTER_API_KEY not provided")
+            raise ValueError(
+                "No API key found. Set LLM_API_KEY (preferred) or OPENROUTER_API_KEY, "
+                "or pass api_key explicitly."
+            )
 
         response = analyze_multiple_images_openrouter(
             image_paths=image_paths,

@@ -62,19 +62,19 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from PIL import Image
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from attacks.common.llm_client import get_client, resolve_api_key
 
 MAX_PARALLEL_DEFAULT = 4
 MAX_PARALLEL_CAP = 16
 
 DEFAULT_MODELS = [
-    "qwen/qwen3-vl-235b-a22b-instruct",
-    "openai/gpt-5.2",
-    "anthropic/claude-haiku-4.5",
-    "google/gemini-3-flash-preview",
-    "qwen/qwen3-vl-32b-instruct",
+    "gpt-5-2-azure-comm-il2",
+    "claude-4-5-sonnet-aws-comm-il2",
+    "claude-4-5-haiku-aws-comm-il2",
 ]
 
 
@@ -150,32 +150,7 @@ def _encode_image_as_data_url(image_path: Path) -> str:
 
 
 def _get_openrouter_client(api_key: Optional[str], base_url: Optional[str]):
-    from openai import OpenAI  # local import
-
-    resolved_base = (
-        base_url
-        or os.environ.get("OLLAMA_API_BASE")
-        or os.environ.get("REVE_API_BASE")
-        or os.environ.get("OPENROUTER_API_BASE")
-        or "https://openrouter.ai/api/v1"
-    )
-    key = (
-        api_key
-        or os.environ.get("OLLAMA_API_KEY")
-        or os.environ.get("REVE_API_KEY")
-        or os.environ.get("OPENROUTER_API_KEY")
-    )
-    if not key:
-        if str(resolved_base).startswith("http://localhost:11434") or str(resolved_base).startswith(
-            "http://127.0.0.1:11434"
-        ):
-            key = "ollama"
-        else:
-            raise ValueError(
-                "API key not provided. Export OLLAMA_API_KEY/REVE_API_KEY/OPENROUTER_API_KEY "
-                "or pass --openrouter-api-key."
-            )
-    return OpenAI(base_url=resolved_base, api_key=key)
+    return get_client(api_key=api_key, base_url=base_url)
 
 
 def _extract_message_text(msg: Any) -> str:
@@ -237,17 +212,22 @@ def _openrouter_chat_with_retries(
     include_reasoning: bool,
     retries: int,
     quiet: bool,
+    base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
+    from attacks.common.llm_client import is_openrouter_base_url
+
     backoff = 1.0
     last_exc: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
+            # `include_reasoning` is an OpenRouter-only extra_body field; only send when talking to OpenRouter
+            extra_body = {"include_reasoning": include_reasoning} if is_openrouter_base_url(base_url) else None
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body={"include_reasoning": True} if include_reasoning else {"include_reasoning": False},
+                extra_body=extra_body if extra_body else None,
             )
             payload = resp.model_dump()
             choice0 = (payload.get("choices") or [{}])[0] if isinstance(payload, dict) else {}
@@ -358,14 +338,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run VLMs on combined text+image riddles (v4).")
     p.add_argument("--in-root", type=str, required=True)
     p.add_argument("--out-root", type=str, required=True)
-    p.add_argument("--openrouter-api-key", type=str, default=None)
+    p.add_argument("--api-key", type=str, default=None)
     p.add_argument(
         "--api-base",
         type=str,
         default="",
         help=(
             "Optional API base URL (e.g., OLLAMA/REVE). "
-            "Falls back to env OLLAMA_API_BASE/REVE_API_BASE/OPENROUTER_API_BASE."
+            "Falls back to env LLM_API_BASE_URL/OLLAMA_API_BASE/REVE_API_BASE/OPENROUTER_API_BASE."
         ),
     )
     p.add_argument(
@@ -432,6 +412,10 @@ def main() -> None:
     out_root = Path(args.out_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
+    api_key = args.api_key or resolve_api_key()
+    if not api_key:
+        raise SystemExit("Please set LLM_API_KEY (or legacy OPENROUTER_API_KEY) before running.")
+
     if args.models.strip():
         vlm_models: List[str] = [m.strip() for m in args.models.split(",") if m.strip()]
     else:
@@ -460,7 +444,7 @@ def main() -> None:
             )
 
     max_parallel = max(1, min(int(args.max_parallel), MAX_PARALLEL_CAP))
-    client = _get_openrouter_client(args.openrouter_api_key, args.api_base or None) if not args.dry_run else None
+    client = _get_openrouter_client(api_key, args.api_base or None) if not args.dry_run else None
 
     # Collect row dirs
     row_dirs: List[Path] = []
@@ -713,6 +697,7 @@ def main() -> None:
                                     include_reasoning=bool(args.include_reasoning),
                                     retries=int(args.retries),
                                     quiet=bool(args.quiet),
+                                    base_url=args.api_base or None,
                                 )
                                 text_replies.append(resp)
 
@@ -735,6 +720,7 @@ def main() -> None:
                                     include_reasoning=bool(args.include_reasoning),
                                     retries=int(args.retries),
                                     quiet=bool(args.quiet),
+                                    base_url=args.api_base or None,
                                 )
                                 vis_replies.append(resp)
 

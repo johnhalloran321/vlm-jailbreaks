@@ -14,6 +14,8 @@ from typing import Dict, List
 
 from openai import OpenAI
 
+DEFAULT_JUDGE_MODELS = "gpt-5-2-azure-comm-il2,claude-4-5-sonnet-aws-comm-il2,claude-4-5-haiku-aws-comm-il2"
+
 
 def slugify(text: str, fallback: str, index: int, used: set[str]) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
@@ -43,11 +45,13 @@ from pathlib import Path
 # Add parent directory to path to enable imports from evals
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from evals.safety_judge import build_judge_prompt
+from attacks.common.llm_client import get_client, is_openrouter_base_url, resolve_api_key
 
 
 def judge_responses(client: OpenAI, model: str, behavior: str, replies: List[str], temperature: float, thinking: bool) -> Dict:
     prompt = build_judge_prompt(behavior, replies)
-    extra = {"include_reasoning": True} if thinking else {}
+    # `include_reasoning` is an OpenRouter-only extra_body field.
+    extra = {"include_reasoning": True} if (thinking and is_openrouter_base_url()) else {}
     resp = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -95,7 +99,7 @@ def main() -> None:
     parser.add_argument(
         "--models",
         type=str,
-        default="x-ai/grok-4.1-fast,google/gemini-3-flash-preview,anthropic/claude-haiku-4.5",
+        default=DEFAULT_JUDGE_MODELS,
         help="Comma-separated list of judge model IDs.",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -110,10 +114,10 @@ def main() -> None:
     parser.add_argument("--vlm-pattern", type=str, default=None, help="Only judge VLM files containing this substring.")
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    api_key = resolve_api_key()
     if not api_key:
-        raise SystemExit("Please set OPENROUTER_API_KEY before running.")
-    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+        raise SystemExit("Please set LLM_API_KEY (or legacy OPENROUTER_API_KEY) before running.")
+    client = get_client(api_key=api_key)
     models = [m.strip() for m in args.models.split(",") if m.strip()]
 
     if not args.csv.exists():

@@ -27,7 +27,12 @@ from openai import OpenAI
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-DEFAULT_OPENROUTER_MODEL = "openai/gpt-5.2"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from attacks.common.llm_client import get_client, resolve_api_key
+
+DEFAULT_OPENROUTER_MODEL = "gpt-5-2-azure-comm-il2"
 DEFAULT_CONCEPTS_CSV = REPO_ROOT / "data" / "concepts.csv"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data" / "textual_replacement"
 DEFAULT_CONCEPT_COLUMN = "Concept"
@@ -188,7 +193,7 @@ def make_call(
     temperature: float,
     max_tokens: int,
 ) -> Callable[[str], str]:
-    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+    client = get_client(api_key=api_key)
 
     def _call(prompt: str) -> str:
         return _chat_openrouter(
@@ -367,9 +372,9 @@ def main() -> None:
     if not concepts_csv.exists():
         raise SystemExit(f"Concepts CSV not found: {concepts_csv}")
 
-    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY")
+    api_key = resolve_api_key(args.api_key)
     if not api_key:
-        raise SystemExit("Missing OPENROUTER_API_KEY (or pass --api-key).")
+        raise SystemExit("Missing LLM_API_KEY (or legacy OPENROUTER_API_KEY; or pass --api-key).")
 
     concepts = load_concepts_from_csv(
         concepts_csv,

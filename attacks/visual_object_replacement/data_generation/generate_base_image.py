@@ -26,14 +26,35 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from attacks.common.llm_client import get_client  # noqa: E402
-from attacks.common.image_gen import request_image_with_retry  # noqa: E402
-from .prompts import CREATE_TEMPLATE, CREATE_TEXT_TEMPLATE  # noqa: E402
+from attacks.common.image_gen import (  # noqa: E402
+    REFUSAL_EXIT_CODE,
+    ImageGenerationRefused,
+    request_image_with_retry,
+)
+from .prompts import (  # noqa: E402
+    CREATE_TEMPLATE,
+    CREATE_TEMPLATE_PHYSICAL_PROP,
+    CREATE_TEXT_TEMPLATE,
+)
 
 
-def build_prompt(object_name: str, extra: Optional[str], attack_type: Optional[str] = None) -> str:
-    """Construct the generation prompt using the create template constant."""
+def build_prompt(
+    object_name: str,
+    extra: Optional[str],
+    attack_type: Optional[str] = None,
+    physical_prompt: bool = False,
+) -> str:
+    """Construct the generation prompt using the create template constant.
+
+    physical_prompt=True swaps in CREATE_TEMPLATE_PHYSICAL_PROP, which forbids
+    representing the object via a text label/sign/on-screen text and instead
+    forces a literal, tangible physical object or invented prop -- matching
+    the paper's Appendix A.2 examples. Default (False) behavior is unchanged.
+    """
     if attack_type == "text_replacement":
         base_prompt = CREATE_TEXT_TEMPLATE.format(target_text=object_name)
+    elif physical_prompt:
+        base_prompt = CREATE_TEMPLATE_PHYSICAL_PROP.format(object=object_name)
     else:
         base_prompt = CREATE_TEMPLATE.format(object=object_name)
     if extra:
@@ -84,6 +105,15 @@ def generate_base_image(
             backoff_base=float(backoff),
             on_retry=_on_retry,
         )
+    except ImageGenerationRefused as exc:
+        # The model explicitly declined (content-safety refusal), not a transient
+        # error -- retrying the identical request won't change that, so this was
+        # NOT retried internally (see request_image_with_retry). Exit with a
+        # distinct sentinel code so run.py's subprocess-relaunch loop also gives
+        # up immediately instead of relaunching this same doomed request up to
+        # MAX_TASK_ATTEMPTS more times.
+        print(f"Image generation declined by the model: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(REFUSAL_EXIT_CODE)
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"Image generation failed after {max_retries} attempts: {exc}") from exc
 
@@ -113,6 +143,17 @@ def main():
         type=str,
         default=None,
         help="Attack type for determining prompt template (e.g., 'text_replacement').",
+    )
+    parser.add_argument(
+        "--physical-prompt",
+        action="store_true",
+        help=(
+            "Use the alternate CREATE_TEMPLATE_PHYSICAL_PROP template, which forbids "
+            "representing the object via a text label/sign/on-screen text and forces a "
+            "literal, tangible physical object or invented prop instead (matching the "
+            "paper's Appendix A.2 examples). Default CREATE_TEMPLATE is unchanged unless "
+            "this flag is passed."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -179,7 +220,7 @@ def main():
     args = parser.parse_args()
 
     client = get_client(api_key=args.api_key, base_url=args.base_url)
-    prompt = build_prompt(args.object, args.extra, args.attack_type)
+    prompt = build_prompt(args.object, args.extra, args.attack_type, physical_prompt=args.physical_prompt)
 
     print(f"Requesting image generation with model={args.model}, image_api={args.image_api}...", flush=True)
 

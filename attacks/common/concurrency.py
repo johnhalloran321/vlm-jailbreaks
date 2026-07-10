@@ -106,6 +106,7 @@ def retry_call(
     max_retries: int,
     backoff_base: float = 2.0,
     on_retry: Optional[Callable[[int, BaseException, float], None]] = None,
+    is_retryable: Optional[Callable[[BaseException], bool]] = None,
 ) -> T:
     """Call ``fn()``, retrying on any exception with rate-limit-aware waits.
 
@@ -115,6 +116,15 @@ def retry_call(
     to exponential backoff with jitter. ``max_retries`` is the number of
     *retries* after the initial attempt, so the call is attempted up to
     ``max_retries + 1`` times total.
+
+    ``is_retryable`` -- optional predicate; when provided and it returns
+    ``False`` for a raised exception, that exception is treated as permanent
+    and re-raised immediately with no further attempts or waiting, regardless
+    of remaining ``max_retries`` budget. Useful for errors that are known to
+    be deterministic for a given input (e.g. an explicit content-safety
+    refusal from a model) where retrying the identical request is virtually
+    guaranteed to fail identically and only wastes time/quota. Defaults to
+    ``None``, which retries every exception (previous behavior).
     """
     last_exc: Optional[BaseException] = None
     for attempt in range(max_retries + 1):
@@ -122,6 +132,8 @@ def retry_call(
             return fn()
         except Exception as exc:  # noqa: BLE001 - deliberately broad: retry any transient failure
             last_exc = exc
+            if is_retryable is not None and not is_retryable(exc):
+                break
             if attempt >= max_retries:
                 break
             if is_rate_limit_error(exc):

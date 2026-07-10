@@ -45,6 +45,7 @@ is in flight.
 from __future__ import annotations
 
 import base64
+import json
 import mimetypes
 import re
 import urllib.request
@@ -131,6 +132,129 @@ def extract_images_from_responses_payload(payload: Dict[str, Any]) -> List[bytes
     return images
 
 
+class ImageGenerationRefused(RuntimeError):
+    """Raised when a response indicates the model declined to generate an
+    image (a content-safety refusal) rather than an ambiguous empty result.
+
+    This is deliberately a distinct exception type from the generic "no
+    image returned" case: a refusal is normally deterministic for a fixed
+    prompt/model, so callers (``request_image_with_retry`` /
+    ``request_image_edit_with_retry`` below) treat it as non-retryable and
+    surface the *reason* instead of silently burning through the configured
+    retry budget on a request that will almost certainly fail identically
+    every time.
+    """
+
+
+def _responses_refusal_reason(payload: Dict[str, Any]) -> Optional[str]:
+    """Best-effort extraction of *why* a Responses API call returned no image.
+
+    A successful ``image_generation_call`` block looks like
+    ``{"type": "image_generation_call", "status": "completed", "result": "<b64>"}``.
+    When the model declines instead, this can show up as that same block
+    with a non-"completed" ``status`` and no ``result``, and/or as a separate
+    ``message`` output block whose ``content`` includes a ``refusal`` part
+    (the Responses API's analogue of chat.completions' ``message.refusal``
+    field). ``incomplete_details`` is also checked since some model families
+    surface content-filter stops there instead. Returns ``None`` if nothing
+    that looks like an explicit refusal/failure reason is found (in which
+    case the caller falls back to a generic "no image returned" error that
+    *is* still retried, since that could just as easily be an unrelated
+    parsing gap as a refusal).
+    """
+    reasons: List[str] = []
+    for block in payload.get("output", []) or []:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "image_generation_call":
+            status = block.get("status")
+            if status and status != "completed":
+                reasons.append(f"image_generation_call status={status!r}")
+        elif btype == "message":
+            for part in block.get("content", []) or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "refusal":
+                    text = part.get("refusal") or part.get("text")
+                    if text:
+                        reasons.append(f"refusal: {text}")
+    incomplete = payload.get("incomplete_details")
+    if isinstance(incomplete, dict) and incomplete.get("reason"):
+        reasons.append(f"incomplete_details.reason={incomplete['reason']!r}")
+    return "; ".join(reasons) if reasons else None
+
+
+def _chat_refusal_reason(payload: Dict[str, Any]) -> Optional[str]:
+    """Same idea as ``_responses_refusal_reason`` but for the legacy
+    chat.completions shape, where a refusal surfaces as ``message.refusal``
+    (a sibling field of ``message.content``), or an unusual ``finish_reason``
+    (e.g. ``content_filter``).
+    """
+    reasons: List[str] = []
+    for choice in payload.get("choices", []) or []:
+        if not isinstance(choice, dict):
+            continue
+        msg = choice.get("message") or {}
+        refusal = msg.get("refusal") if isinstance(msg, dict) else None
+        if isinstance(refusal, str) and refusal.strip():
+            reasons.append(f"refusal: {refusal.strip()}")
+        finish_reason = choice.get("finish_reason")
+        if finish_reason and finish_reason not in ("stop", "length"):
+            reasons.append(f"finish_reason={finish_reason!r}")
+    return "; ".join(reasons) if reasons else None
+
+
+# Sentinel subprocess exit code the generate_base_image.py / generate_attack_image.py
+# CLI scripts use to signal "the model explicitly refused this request; don't bother
+# relaunching me, retrying won't help" up to their caller (run.py), distinct from a
+# plain exit(1) for genuinely transient/unknown failures that ARE worth relaunching
+# for. Kept here (rather than duplicated as a magic number in three files) since all
+# three already import from this module.
+REFUSAL_EXIT_CODE = 2
+
+
+def _summarize_payload_for_diagnostics(payload: Dict[str, Any], max_len: int = 600) -> str:
+    """Render a response payload as a compact, terminal-safe diagnostic string.
+
+    Used only for the "ambiguous empty response" case -- no images extracted,
+    and neither ``_responses_refusal_reason`` nor ``_chat_refusal_reason``
+    found anything that looks like an explicit refusal marker. Rather than
+    raising a bare "no image returned" with zero context (which is what made
+    it hard to tell, from the terminal alone, whether a given failure was a
+    safety decline vs. something else entirely), this gets folded into the
+    exception message so it shows up for free in every caller's existing
+    ``on_retry``/failure print statements.
+
+    Any string field longer than ~120 chars (e.g. a lingering base64 image
+    fragment, a long revised_prompt, etc.) is truncated so this can't
+    accidentally dump megabytes of data into the logs; lists are capped at 10
+    entries for the same reason.
+    """
+
+    def _redact(obj: Any) -> Any:
+        if isinstance(obj, str):
+            if len(obj) > 120:
+                return obj[:80] + f"...<{len(obj)} chars total>"
+            return obj
+        if isinstance(obj, dict):
+            return {k: _redact(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            shown = [_redact(v) for v in obj[:10]]
+            if len(obj) > 10:
+                shown.append(f"...<{len(obj)} items total>")
+            return shown
+        return obj
+
+    try:
+        text = json.dumps(_redact(payload), ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001 - a diagnostic helper must never itself raise
+        text = repr(payload)
+    if len(text) > max_len:
+        text = text[:max_len] + f"...<{len(text)} chars total>"
+    return text
+
+
 def infer_image_api_style(model: str) -> str:
     """Best-effort guess at which API shape a given image-gen model expects.
 
@@ -162,6 +286,9 @@ def request_image(
     ``api_style``: "auto" (guess from model name), "chat" (legacy
     chat.completions + response_format=image), or "responses" (Responses API
     + image_generation tool).
+
+    Raises ``ImageGenerationRefused`` (see below) instead of returning ``[]``
+    when the response itself indicates the model declined the request.
     """
     style = api_style if api_style in ("chat", "responses") else infer_image_api_style(model)
 
@@ -178,7 +305,16 @@ def request_image(
             kwargs["temperature"] = temperature
         response = client.responses.create(**kwargs)
         payload = response.model_dump()
-        return extract_images_from_responses_payload(payload)
+        images = extract_images_from_responses_payload(payload)
+        if not images:
+            reason = _responses_refusal_reason(payload)
+            if reason:
+                raise ImageGenerationRefused(reason)
+            raise RuntimeError(
+                "No image returned in response (no refusal signal detected either). "
+                f"Raw payload: {_summarize_payload_for_diagnostics(payload)}"
+            )
+        return images
 
     kwargs = {
         "model": model,
@@ -196,7 +332,16 @@ def request_image(
         kwargs["extra_body"] = {"image_config": image_config}
     response = client.chat.completions.create(**kwargs)
     payload = response.model_dump()
-    return extract_images_from_chat_payload(payload)
+    images = extract_images_from_chat_payload(payload)
+    if not images:
+        reason = _chat_refusal_reason(payload)
+        if reason:
+            raise ImageGenerationRefused(reason)
+        raise RuntimeError(
+            "No image returned in response (no refusal signal detected either). "
+            f"Raw payload: {_summarize_payload_for_diagnostics(payload)}"
+        )
+    return images
 
 
 def _to_data_url(image: Union[str, Path, bytes]) -> str:
@@ -269,7 +414,16 @@ def request_image_edit(
             kwargs["temperature"] = temperature
         response = client.responses.create(**kwargs)
         payload = response.model_dump()
-        return extract_images_from_responses_payload(payload)
+        images = extract_images_from_responses_payload(payload)
+        if not images:
+            reason = _responses_refusal_reason(payload)
+            if reason:
+                raise ImageGenerationRefused(reason)
+            raise RuntimeError(
+                "No image returned in response (no refusal signal detected either). "
+                f"Raw payload: {_summarize_payload_for_diagnostics(payload)}"
+            )
+        return images
 
     chat_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
     for url in data_urls:
@@ -290,7 +444,16 @@ def request_image_edit(
         kwargs["extra_body"] = {"image_config": image_config}
     response = client.chat.completions.create(**kwargs)
     payload = response.model_dump()
-    return extract_images_from_chat_payload(payload)
+    images = extract_images_from_chat_payload(payload)
+    if not images:
+        reason = _chat_refusal_reason(payload)
+        if reason:
+            raise ImageGenerationRefused(reason)
+        raise RuntimeError(
+            "No image returned in response (no refusal signal detected either). "
+            f"Raw payload: {_summarize_payload_for_diagnostics(payload)}"
+        )
+    return images
 
 
 # ============================================================================
@@ -340,15 +503,23 @@ def request_image_with_retry(
 
     On HTTP 429 responses, honors a server-provided ``Retry-After`` header
     when present; otherwise (and for any other transient error, including an
-    empty/no-image response) falls back to exponential backoff with jitter.
-    ``max_retries`` is the number of retries after the first attempt (default
-    3, i.e. up to 4 attempts total).
+    empty/no-image response of unknown cause) falls back to exponential
+    backoff with jitter. ``max_retries`` is the number of retries after the
+    first attempt (default 3, i.e. up to 4 attempts total).
+
+    Exception: an ``ImageGenerationRefused`` (an explicit content-safety
+    refusal detected in the response) is NOT retried -- it's raised
+    immediately on the first attempt. Retrying an identical request that the
+    model has already explicitly declined is virtually always wasted
+    time/quota, since the outcome is normally deterministic for a fixed
+    prompt.
     """
     return _retry_call(
         _require_nonempty(lambda: request_image(client, model=model, prompt=prompt, **kwargs)),
         max_retries=max_retries,
         backoff_base=backoff_base,
         on_retry=on_retry,
+        is_retryable=lambda exc: not isinstance(exc, ImageGenerationRefused),
     )
 
 
@@ -366,8 +537,9 @@ def request_image_edit_with_retry(
     """``request_image_edit()`` wrapped with rate-limit-aware retry + backoff.
 
     Same retry/backoff semantics as ``request_image_with_retry()`` -- see its
-    docstring for details (including treating an empty/no-image response as a
-    retryable failure).
+    docstring for details, including treating an empty/no-image response of
+    unknown cause as retryable, but an explicit ``ImageGenerationRefused``
+    as non-retryable.
     """
     return _retry_call(
         _require_nonempty(
@@ -376,4 +548,5 @@ def request_image_edit_with_retry(
         max_retries=max_retries,
         backoff_base=backoff_base,
         on_retry=on_retry,
+        is_retryable=lambda exc: not isinstance(exc, ImageGenerationRefused),
     )

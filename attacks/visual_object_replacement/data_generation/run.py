@@ -46,6 +46,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from attacks.common.image_gen import REFUSAL_EXIT_CODE  # noqa: E402
+
 # NOTE: this used to be 4, which silently contradicted the --max-parallel
 # help text ("hard capped at 8") below, since this same constant is used both
 # as the default *and* as the hard cap (`min(args.max_parallel,
@@ -90,6 +92,17 @@ def run_generation_task(
             if result and result.returncode == 0:
                 print(f"[{thread_name}] Completed {description}")
                 return True
+            if result and result.returncode == REFUSAL_EXIT_CODE:
+                # The model explicitly declined this request (content-safety
+                # refusal, surfaced via attacks.common.image_gen.ImageGenerationRefused).
+                # That's normally deterministic for a fixed prompt, so relaunching
+                # the identical subprocess up to max_attempts more times would just
+                # waste time repeating a doomed request -- give up immediately.
+                print(
+                    f"[{thread_name}] {description} was declined by the model (refusal) -- "
+                    f"not retrying further attempts."
+                )
+                break
             if result:
                 print(
                     f"[{thread_name}] {description} failed with exit {result.returncode}"
@@ -115,6 +128,7 @@ def generate_base_images(
     failure_tracker: FailureTracker,
     task_attempts: int,
     attack_type: Optional[str] = None,
+    physical_prompt: bool = False,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     futures = []
@@ -145,6 +159,8 @@ def generate_base_images(
         ]
         if attack_type:
             cmd += ["--attack-type", attack_type]
+        if physical_prompt:
+            cmd.append("--physical-prompt")
         env = os.environ.copy()
         if api_key:
             env["LLM_API_KEY"] = api_key
@@ -177,6 +193,7 @@ def run_attack(
     executor: ThreadPoolExecutor = None,
     failure_tracker: FailureTracker = None,
     task_attempts: int = MAX_TASK_ATTEMPTS,
+    physical_prompt: bool = False,
 ):
     cmd = [
         sys.executable,
@@ -196,6 +213,8 @@ def run_attack(
     ]
     if replacement_object:
         cmd += ["--replacement-object", replacement_object]
+    if physical_prompt:
+        cmd.append("--physical-prompt")
 
     env = os.environ.copy()
     if api_key:
@@ -227,6 +246,7 @@ def run_attacks_for_object(
     executor: ThreadPoolExecutor,
     failure_tracker: FailureTracker,
     task_attempts: int,
+    physical_prompt: bool = False,
 ):
     futures = []
     for img_path in sorted(base_images_dir.glob("*.png")):
@@ -262,6 +282,7 @@ def run_attacks_for_object(
                             executor=executor,
                             failure_tracker=failure_tracker,
                             task_attempts=task_attempts,
+                            physical_prompt=physical_prompt,
                         )
                     )
             elif attack_type == "text_replacement":
@@ -290,6 +311,7 @@ def run_attacks_for_object(
                             executor=executor,
                             failure_tracker=failure_tracker,
                             task_attempts=task_attempts,
+                            physical_prompt=physical_prompt,
                         )
                     )
             else:
@@ -312,6 +334,7 @@ def run_attacks_for_object(
                         executor=executor,
                         failure_tracker=failure_tracker,
                         task_attempts=task_attempts,
+                        physical_prompt=physical_prompt,
                     )
                 )
     return futures
@@ -356,6 +379,18 @@ def main():
         "--redo-existing",
         action="store_true",
         help="If set, re-run generation even when output files already exist.",
+    )
+    parser.add_argument(
+        "--physical-prompt",
+        action="store_true",
+        help=(
+            "Pass --physical-prompt through to every generate_base_image.py / "
+            "generate_attack_image.py subprocess, forcing the alternate "
+            "CREATE_TEMPLATE_PHYSICAL_PROP / EDIT_TEMPLATE_PHYSICAL_PROP templates "
+            "(literal physical-object substitution, matching the paper's Appendix "
+            "A.2 examples) instead of the default templates. Default behavior is "
+            "unchanged unless this flag is passed."
+        ),
     )
     parser.add_argument(
         "--max-parallel",
@@ -419,6 +454,7 @@ def main():
                     failure_tracker=failure_tracker,
                     task_attempts=MAX_TASK_ATTEMPTS,
                     attack_type=attack_type_for_base,
+                    physical_prompt=args.physical_prompt,
                 )
             )
         for future in base_futures:
@@ -442,6 +478,7 @@ def main():
                     executor=executor,
                     failure_tracker=failure_tracker,
                     task_attempts=MAX_TASK_ATTEMPTS,
+                    physical_prompt=args.physical_prompt,
                 )
             )
         for future in attack_futures:

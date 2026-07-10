@@ -25,10 +25,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from attacks.common.llm_client import get_client  # noqa: E402
-from attacks.common.image_gen import request_image_edit_with_retry  # noqa: E402
+from attacks.common.image_gen import (  # noqa: E402
+    REFUSAL_EXIT_CODE,
+    ImageGenerationRefused,
+    request_image_edit_with_retry,
+)
 from .prompts import (  # noqa: E402
     EDIT_BBBLORK_TEMPLATE,
     EDIT_TEMPLATE,
+    EDIT_TEMPLATE_PHYSICAL_PROP,
     EDIT_TEXT_TEMPLATE,
     REMOVE_OBJECT_TEMPLATE,
 )
@@ -77,6 +82,14 @@ def generate_attack_image(
             backoff_base=float(backoff),
             on_retry=_on_retry,
         )
+    except ImageGenerationRefused as exc:
+        # See the matching comment in generate_base_image.py: this is an explicit
+        # content-safety refusal (not a transient error), was not retried
+        # internally, and gets a distinct exit code so run.py stops relaunching
+        # this same doomed request immediately instead of burning through
+        # MAX_TASK_ATTEMPTS more subprocess relaunches.
+        print(f"Image edit declined by the model: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(REFUSAL_EXIT_CODE)
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"Image edit failed after {max_retries} attempts: {exc}") from exc
 
@@ -113,6 +126,17 @@ def main():
         type=str,
         default="banana",
         help="Name of the object that should replace the original object (default: banana).",
+    )
+    parser.add_argument(
+        "--physical-prompt",
+        action="store_true",
+        help=(
+            "Use the alternate EDIT_TEMPLATE_PHYSICAL_PROP template (only applies to "
+            "--attack-type replace_with_object), which forbids swapping any text/label/"
+            "signage and forces a literal, tangible physical-object substitution instead "
+            "(matching the paper's Appendix A.2 examples). Default EDIT_TEMPLATE is "
+            "unchanged unless this flag is passed."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -175,7 +199,8 @@ def main():
     if attack_type == "replace_with_object":
         if not args.replacement_object:
             raise ValueError("Provide --replacement-object for replace_with_object.")
-        base_prompt = EDIT_TEMPLATE.format(
+        template = EDIT_TEMPLATE_PHYSICAL_PROP if args.physical_prompt else EDIT_TEMPLATE
+        base_prompt = template.format(
             original_object=args.original_object,
             replacement_object=args.replacement_object,
         )

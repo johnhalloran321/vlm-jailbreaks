@@ -29,7 +29,8 @@ import json
 import os
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -42,6 +43,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from attacks.common.llm_client import get_client, resolve_api_key
 from attacks.common.image_gen import DEFAULT_MAX_PARALLEL, request_image_with_retry
+from attacks.common.concurrency import retry_call
+
+_print_lock = threading.Lock()
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    with _print_lock:
+        print(f"[{ts}] {msg}", flush=True)
 
 
 def _utc_ts() -> str:
@@ -56,8 +66,10 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _get_openrouter_client(api_key: Optional[str], base_url: Optional[str]):
-    return get_client(api_key=api_key, base_url=base_url)
+def _get_openrouter_client(
+    api_key: Optional[str], base_url: Optional[str], timeout: Optional[float] = None
+):
+    return get_client(api_key=api_key, base_url=base_url, timeout=timeout)
 
 
 def _extract_message_text(msg: Any) -> str:
@@ -153,6 +165,7 @@ def generate_image_prompt_options(
     max_tokens: int,
     include_reasoning: bool,
     base_url: Optional[str] = None,
+    max_retries: int = 3,
 ) -> Dict[str, Any]:
     from attacks.common.llm_client import is_openrouter_base_url
 
@@ -170,23 +183,58 @@ def generate_image_prompt_options(
     user = f'Text riddle:\n"""{text_riddle}"""'
     # `include_reasoning` is an OpenRouter-only extra_body field; only send when talking to OpenRouter
     extra_body = {"include_reasoning": include_reasoning} if is_openrouter_base_url(base_url) else None
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=temperature,
-        max_tokens=max_tokens,
-        response_format={"type": "json_object"},
-        extra_body=extra_body if extra_body else None,
-    )
-    payload = resp.model_dump()
-    msg = (payload.get("choices") or [{}])[0].get("message")
-    text = _extract_message_text(msg)
-    parsed = _parse_json_obj(text)
-    prompts = parsed.get("prompts")
-    if not isinstance(prompts, list):
-        prompts = []
-    prompts = [p for p in prompts if isinstance(p, str) and p.strip()]
-    prompts = prompts[: max(1, n_options)]
+
+    class _NoPromptsReturned(RuntimeError):
+        """Raised when a *successful* API response yields zero usable prompts.
+
+        This happens when the model refuses, returns malformed JSON, or an
+        empty ``prompts`` list -- none of which raise an exception on their
+        own. Wrapping it as an exception lets it ride the same retry_call
+        loop (and backoff) as transient network/rate-limit errors below,
+        instead of being treated as an immediate terminal failure after a
+        single attempt.
+        """
+
+        def __init__(self, raw_text: str, raw_payload: Dict[str, Any]):
+            super().__init__("prompt-gen returned no usable prompts (empty/unparseable/refusal)")
+            self.raw_text = raw_text
+            self.raw_payload = raw_payload
+
+    def _call() -> Tuple[List[str], str, Dict[str, Any]]:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            extra_body=extra_body if extra_body else None,
+        )
+        payload = resp.model_dump()
+        msg = (payload.get("choices") or [{}])[0].get("message")
+        text = _extract_message_text(msg)
+        parsed = _parse_json_obj(text)
+        prompts = parsed.get("prompts")
+        if not isinstance(prompts, list):
+            prompts = []
+        prompts = [p for p in prompts if isinstance(p, str) and p.strip()]
+        prompts = prompts[: max(1, n_options)]
+        if not prompts:
+            raise _NoPromptsReturned(text, payload)
+        return prompts, text, payload
+
+    def _on_retry(attempt: int, exc: BaseException, wait: float) -> None:
+        _log(
+            f"  prompt-gen attempt {attempt + 1}/{max_retries + 1} failed: {exc} "
+            f"(retrying in {wait:.1f}s)"
+        )
+
+    try:
+        prompts, text, payload = retry_call(_call, max_retries=max_retries, on_retry=_on_retry)
+    except _NoPromptsReturned as exc:
+        prompts, text, payload = [], exc.raw_text, exc.raw_payload
+    except Exception as exc:  # noqa: BLE001 - transient error exhausted all retries
+        prompts, text, payload = [], str(exc), {}
+
     return {
         "prompt_gen_model": model,
         "timestamp_utc": _utc_ts(),
@@ -332,6 +380,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_PARALLEL,
         help=f"Number of concurrent worker threads (default {DEFAULT_MAX_PARALLEL}). Use 1 for sequential.",
     )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="Per-request client timeout in seconds (default 180.0). Prevents a single stalled "
+        "request from blocking indefinitely.",
+    )
     return p.parse_args()
 
 
@@ -358,16 +413,19 @@ def _process_item(
     option_idx = int(item["option_idx"])
     text_riddle = item["text_riddle"]
     safe_prompt = item.get("safe_prompt", "")
+    tag = f"{category}/{row_slug}/{concept_type}/option_{option_idx:03d}"
 
     out_dir = out_root / category / row_slug / concept_type / f"option_{option_idx:03d}"
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "image_manifest.json"
     if args.skip_existing and manifest_path.exists() and _has_enough_images(out_dir, args.images_per_option):
+        _log(f"[{idx + 1}/{args.n_items}] {tag}: skipped (already complete)")
         return
 
     (out_dir / "safe_prompt.txt").write_text((safe_prompt or "") + "\n", encoding="utf-8")
     (out_dir / "text_riddle.txt").write_text(text_riddle + "\n", encoding="utf-8")
 
+    _log(f"[{idx + 1}/{args.n_items}] {tag}: generating image prompt options...")
     prompt_payload = generate_image_prompt_options(
         client=client,
         model=args.prompt_gen_model,
@@ -377,10 +435,12 @@ def _process_item(
         max_tokens=1200,
         include_reasoning=bool(args.prompt_include_reasoning),
         base_url=api_base,
+        max_retries=int(args.retries),
     )
     _write_json(out_dir / "image_prompt_options.json", prompt_payload)
     prompts = prompt_payload.get("prompts") or []
     if not prompts:
+        _log(f"[{idx + 1}/{args.n_items}] {tag}: FAILED (no prompts returned by prompt-gen model)")
         _write_json(
             manifest_path,
             {
@@ -399,6 +459,7 @@ def _process_item(
     selected = str(prompts[pick]).strip()
     (out_dir / "selected_image_prompt.txt").write_text(selected + "\n", encoding="utf-8")
 
+    _log(f"[{idx + 1}/{args.n_items}] {tag}: rendering {args.images_per_option} image(s)...")
     images_dir = out_dir / "images"
     records = generate_images_for_prompt(
         client=client,
@@ -413,6 +474,8 @@ def _process_item(
         out_dir=images_dir,
         image_api=args.image_api,
     )
+    n_ok = sum(1 for r in records if "file" in r)
+    _log(f"[{idx + 1}/{args.n_items}] {tag}: done ({n_ok}/{len(records)} images ok)")
 
     _write_json(
         manifest_path,
@@ -449,7 +512,7 @@ def main() -> None:
     if not api_key:
         raise SystemExit("Please set LLM_API_KEY (or legacy OPENROUTER_API_KEY) before running.")
 
-    client = _get_openrouter_client(api_key, args.api_base or None)
+    client = _get_openrouter_client(api_key, args.api_base or None, timeout=args.timeout)
     image_config = {"size": "1024x1024"}
 
     allow = args.allow_categories or []
@@ -461,6 +524,11 @@ def main() -> None:
     items = _iter_text_riddle_options(text_root)
     if not items:
         raise SystemExit("No text riddle options found.")
+    args.n_items = len(items)
+    _log(
+        f"Starting: {len(items)} item(s), max_parallel={max_parallel}, "
+        f"timeout={args.timeout}s, retries={args.retries}"
+    )
 
     if max_parallel <= 1:
         for idx, item in enumerate(items):
@@ -476,25 +544,28 @@ def main() -> None:
                 api_base=args.api_base or None,
             )
     else:
-        with ThreadPoolExecutor(max_workers=max_parallel) as ex:
-            futures = []
+        with ThreadPoolExecutor(max_workers=max_parallel, thread_name_prefix="ImageRiddleWorker") as ex:
+            future_to_idx = {}
             for idx, item in enumerate(items):
-                futures.append(
-                    ex.submit(
-                        _process_item,
-                        item=item,
-                        idx=idx,
-                        args=args,
-                        client=client,
-                        image_config=image_config,
-                        out_root=out_root,
-                        allow=allow,
-                        only_types=only_types,
-                        api_base=args.api_base or None,
-                    )
+                future = ex.submit(
+                    _process_item,
+                    item=item,
+                    idx=idx,
+                    args=args,
+                    client=client,
+                    image_config=image_config,
+                    out_root=out_root,
+                    allow=allow,
+                    only_types=only_types,
+                    api_base=args.api_base or None,
                 )
-            for f in futures:
-                f.result()
+                future_to_idx[future] = idx
+            # Iterate in completion order (not submission order) so a single slow/stuck
+            # early item can't mask visibility into everything that's already finished.
+            for future in as_completed(future_to_idx):
+                future.result()
+
+    _log(f"Done: {len(items)} item(s) processed.")
 
 
 if __name__ == "__main__":
